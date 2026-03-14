@@ -500,3 +500,124 @@ test "lightpanda parity: all new methods are unique strings" {
         }
     }
 }
+
+// ─── Tier 1 Handler Logic Tests ──────────────────────────────────────────
+
+test "action kinds support new tier 1 types" {
+    const actions = @import("../cdp/actions.zig");
+    // Verify all new action kinds resolve correctly
+    try std.testing.expect(actions.ActionKind.fromString("dblclick") != null);
+    try std.testing.expect(actions.ActionKind.fromString("check") != null);
+    try std.testing.expect(actions.ActionKind.fromString("uncheck") != null);
+    try std.testing.expect(actions.ActionKind.fromString("blur") != null);
+
+    // Verify original ones still work
+    try std.testing.expect(actions.ActionKind.fromString("click") != null);
+    try std.testing.expect(actions.ActionKind.fromString("fill") != null);
+    try std.testing.expect(actions.ActionKind.fromString("hover") != null);
+
+    // Unknown still returns null
+    try std.testing.expect(actions.ActionKind.fromString("swipe") == null);
+}
+
+test "ref cache supports tier 1 handler lookups" {
+    // Simulates what scrollintoview, highlight, drag handlers do:
+    // 1. Put refs in cache from snapshot
+    // 2. Look them up by ref name to get backend node IDs
+    var cache = SnapshotRefCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    // Simulate snapshot populating refs
+    try cache.put("e0", 100);
+    try cache.put("e1", 101);
+    try cache.put("e2", 102);
+    try cache.put("e3", 103);
+
+    // scrollintoview: lookup single ref
+    try std.testing.expectEqual(@as(?u32, 100), cache.get("e0"));
+
+    // drag: lookup src and tgt refs
+    try std.testing.expectEqual(@as(?u32, 101), cache.get("e1"));
+    try std.testing.expectEqual(@as(?u32, 103), cache.get("e3"));
+
+    // highlight: lookup ref
+    try std.testing.expectEqual(@as(?u32, 102), cache.get("e2"));
+
+    // Unknown ref returns null (handler should return 400)
+    try std.testing.expect(cache.get("e99") == null);
+}
+
+test "bridge tab operations for tab/new and tab/close" {
+    var bridge = Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+
+    // Initially no tabs
+    try std.testing.expectEqual(@as(usize, 0), bridge.tabCount());
+
+    // Simulate adding tabs (what tab/new does after CDP call)
+    try bridge.putTab(.{
+        .id = "tab-1",
+        .ws_url = "ws://127.0.0.1:9222/devtools/page/tab-1",
+        .url = "about:blank",
+        .title = "New Tab",
+        .created_at = 1000,
+        .last_accessed = 1000,
+    });
+    try std.testing.expectEqual(@as(usize, 1), bridge.tabCount());
+
+    try bridge.putTab(.{
+        .id = "tab-2",
+        .ws_url = "ws://127.0.0.1:9222/devtools/page/tab-2",
+        .url = "https://example.com",
+        .title = "Example",
+        .created_at = 1001,
+        .last_accessed = 1001,
+    });
+    try std.testing.expectEqual(@as(usize, 2), bridge.tabCount());
+
+    // tab/close: remove specific tab
+    bridge.removeTab("tab-1");
+    try std.testing.expectEqual(@as(usize, 1), bridge.tabCount());
+
+    // Verify correct tab was removed
+    try std.testing.expect(bridge.getCdpClient("tab-1") == null);
+}
+
+test "CDP protocol methods for tier 1 endpoints exist" {
+    // Input domain
+    try std.testing.expectEqualStrings("Input.dispatchKeyEvent", protocol.Methods.input_dispatch_key_event);
+    try std.testing.expectEqualStrings("Input.insertText", protocol.Methods.input_insert_text);
+    try std.testing.expectEqualStrings("Input.dispatchMouseEvent", protocol.Methods.input_dispatch_mouse_event);
+
+    // DOM scroll
+    try std.testing.expectEqualStrings("DOM.scrollIntoViewIfNeeded", protocol.Methods.dom_scroll_into_view);
+
+    // Emulation
+    try std.testing.expectEqualStrings("Emulation.setEmulatedMedia", protocol.Methods.emulation_set_emulated_media);
+
+    // Network
+    try std.testing.expectEqualStrings("Network.emulateNetworkConditions", protocol.Methods.network_emulate_conditions);
+}
+
+test "snapshot ref cache clear and repopulate cycle" {
+    // Tests the pattern: navigate → snapshot → action → re-snapshot
+    // The ref cache must be clearable and repopulatable
+    var cache = SnapshotRefCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    // First snapshot
+    try cache.put("e0", 10);
+    try cache.put("e1", 11);
+    try std.testing.expectEqual(@as(?u32, 10), cache.get("e0"));
+
+    // After re-snapshot, refs may change (page re-rendered)
+    cache.clear();
+    try std.testing.expect(cache.get("e0") == null);
+
+    // New snapshot populates different refs
+    try cache.put("e0", 20); // same name, different node ID
+    try cache.put("e1", 21);
+    try cache.put("e2", 22); // new element appeared
+    try std.testing.expectEqual(@as(?u32, 20), cache.get("e0"));
+    try std.testing.expectEqual(@as(?u32, 22), cache.get("e2"));
+}

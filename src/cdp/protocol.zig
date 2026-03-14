@@ -102,6 +102,46 @@ pub const Methods = struct {
     pub const dom_query_selector = "DOM.querySelector";
     pub const dom_query_selector_all = "DOM.querySelectorAll";
     pub const dom_get_outer_html = "DOM.getOuterHTML";
+
+    // Input domain (keyboard, mouse)
+    pub const input_dispatch_key_event = "Input.dispatchKeyEvent";
+    pub const input_insert_text = "Input.insertText";
+    pub const input_dispatch_mouse_event = "Input.dispatchMouseEvent";
+
+    // DOM domain (scroll into view)
+    pub const dom_scroll_into_view = "DOM.scrollIntoViewIfNeeded";
+
+    // Emulation domain (media, offline)
+    pub const emulation_set_emulated_media = "Emulation.setEmulatedMedia";
+
+    // Network domain (offline mode)
+    pub const network_emulate_conditions = "Network.emulateNetworkConditions";
+
+    // Page domain (JavaScript dialog)
+    pub const page_handle_dialog = "Page.handleJavaScriptDialog";
+
+    // Runtime domain (exceptions)
+    pub const runtime_exception_thrown = "Runtime.exceptionThrown";
+
+    // Tracing domain
+    pub const tracing_start = "Tracing.start";
+    pub const tracing_end = "Tracing.end";
+
+    // Profiler domain
+    pub const profiler_enable = "Profiler.enable";
+    pub const profiler_disable = "Profiler.disable";
+    pub const profiler_start = "Profiler.start";
+    pub const profiler_stop = "Profiler.stop";
+
+    // Inspector domain
+    pub const inspector_enable = "Inspector.enable";
+
+    // Target domain (new tab/window)
+    pub const target_create_browser_context = "Target.createBrowserContext";
+
+    // Page domain (frame/dialog)
+    pub const page_get_frame_tree = "Page.getFrameTree";
+    pub const page_enable = "Page.enable";
 };
 
 test "methods are valid strings" {
@@ -121,4 +161,13 @@ test "lightpanda parity CDP methods" {
     try std.testing.expectEqualStrings("DOM.querySelector", Methods.dom_query_selector);
     try std.testing.expectEqualStrings("DOM.querySelectorAll", Methods.dom_query_selector_all);
     try std.testing.expectEqualStrings("DOM.getOuterHTML", Methods.dom_get_outer_html);
+}
+
+test "tier 1 parity CDP methods" {
+    try std.testing.expectEqualStrings("Input.dispatchKeyEvent", Methods.input_dispatch_key_event);
+    try std.testing.expectEqualStrings("Input.insertText", Methods.input_insert_text);
+    try std.testing.expectEqualStrings("Input.dispatchMouseEvent", Methods.input_dispatch_mouse_event);
+    try std.testing.expectEqualStrings("DOM.scrollIntoViewIfNeeded", Methods.dom_scroll_into_view);
+    try std.testing.expectEqualStrings("Emulation.setEmulatedMedia", Methods.emulation_set_emulated_media);
+    try std.testing.expectEqualStrings("Network.emulateNetworkConditions", Methods.network_emulate_conditions);
 }
