@@ -3,6 +3,8 @@ const validator = @import("crawler/validator.zig");
 const markdown = @import("crawler/markdown.zig");
 const js_engine = @import("js_engine.zig");
 
+const version = "0.2.0";
+
 pub fn main() !void {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
@@ -11,36 +13,64 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(gpa);
     defer std.process.argsFree(gpa, args);
 
-    var dump_mode: DumpMode = .markdown;
-    var url: ?[]const u8 = null;
-    var run_js = false;
+    var opts = Options{};
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--dump") or std.mem.eql(u8, args[i], "-d")) {
             i += 1;
-            if (i >= args.len) fatal("--dump requires a value: markdown|html|links|text");
-            dump_mode = parseDumpMode(args[i]) orelse fatal("invalid --dump value: use markdown|html|links|text");
+            if (i >= args.len) fatal("--dump requires a value: markdown|html|links|text|json");
+            opts.dump_mode = parseDumpMode(args[i]) orelse fatal("invalid --dump value: use markdown|html|links|text|json");
         } else if (std.mem.eql(u8, args[i], "--js") or std.mem.eql(u8, args[i], "-j")) {
-            run_js = true;
+            opts.run_js = true;
+        } else if (std.mem.eql(u8, args[i], "--json")) {
+            opts.dump_mode = .json;
+        } else if (std.mem.eql(u8, args[i], "--quiet") or std.mem.eql(u8, args[i], "-q")) {
+            opts.quiet = true;
+        } else if (std.mem.eql(u8, args[i], "--no-color")) {
+            opts.no_color = true;
+        } else if (std.mem.eql(u8, args[i], "--output") or std.mem.eql(u8, args[i], "-o")) {
+            i += 1;
+            if (i >= args.len) fatal("--output requires a file path");
+            opts.output_file = args[i];
+        } else if (std.mem.eql(u8, args[i], "--user-agent") or std.mem.eql(u8, args[i], "-U")) {
+            i += 1;
+            if (i >= args.len) fatal("--user-agent requires a value");
+            opts.user_agent = args[i];
+        } else if (std.mem.eql(u8, args[i], "--version") or std.mem.eql(u8, args[i], "-V")) {
+            const stdout = std.fs.File.stdout();
+            stdout.writeAll("browdie-fetch " ++ version ++ "\n") catch {};
+            return;
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             printUsage();
             return;
         } else if (args[i].len > 0 and args[i][0] != '-') {
-            url = args[i];
+            opts.url = args[i];
         } else {
-            fatal("unknown flag");
+            std.debug.print("error: unknown flag '{s}'\n", .{args[i]});
+            std.debug.print("Run 'browdie-fetch --help' for usage.\n", .{});
+            std.process.exit(1);
         }
     }
 
-    const target_url = url orelse {
+    const target_url = opts.url orelse {
         printUsage();
         std.process.exit(1);
     };
 
+    const color = shouldUseColor(opts.no_color);
+
     // SSRF defense via existing validator
     validator.validateUrl(target_url) catch |err| {
-        std.debug.print("URL validation failed: {s}\n", .{@errorName(err)});
+        if (color) {
+            std.debug.print("\x1b[31m✗\x1b[0m URL blocked: {s}\n", .{@errorName(err)});
+        } else {
+            std.debug.print("error: URL blocked: {s}\n", .{@errorName(err)});
+        }
+        if (err == validator.ValidationError.InvalidScheme)
+            std.debug.print("  hint: only http:// and https:// URLs are allowed\n", .{});
+        if (err == validator.ValidationError.PrivateIp or err == validator.ValidationError.LocalhostBlocked)
+            std.debug.print("  hint: private/localhost URLs are blocked for SSRF protection\n", .{});
         std.process.exit(1);
     };
 
@@ -48,14 +78,38 @@ pub fn main() !void {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var html = fetchHttp(arena, target_url) catch |err| {
-        std.debug.print("fetch failed: {s}\n", .{@errorName(err)});
+    // Status: fetching
+    if (!opts.quiet) {
+        if (color) {
+            std.debug.print("\x1b[2m→\x1b[0m fetching \x1b[4m{s}\x1b[0m\n", .{target_url});
+        } else {
+            std.debug.print("fetching {s}\n", .{target_url});
+        }
+    }
+
+    const fetch_start = std.time.nanoTimestamp();
+
+    var html = fetchHttp(arena, target_url, opts.user_agent) catch |err| {
+        if (color) {
+            std.debug.print("\x1b[31m✗\x1b[0m fetch failed: {s}\n", .{@errorName(err)});
+        } else {
+            std.debug.print("error: fetch failed: {s}\n", .{@errorName(err)});
+        }
         std.process.exit(1);
     };
 
-    // Optional: run inline <script> tags through QuickJS
-    if (run_js) {
-        if (js_engine.evalHtmlScripts(html, arena)) |maybe_output| {
+    const fetch_ms = elapsed(fetch_start);
+
+    // Optional: run inline <script> tags through QuickJS (with DOM stubs)
+    if (opts.run_js) {
+        if (!opts.quiet) {
+            if (color) {
+                std.debug.print("\x1b[2m→\x1b[0m executing inline scripts via QuickJS\n", .{});
+            } else {
+                std.debug.print("executing inline scripts\n", .{});
+            }
+        }
+        if (js_engine.evalHtmlScriptsWithUrl(html, target_url, arena)) |maybe_output| {
             if (maybe_output) |js_output| {
                 if (js_output.len > 0) {
                     const combined = std.fmt.allocPrint(arena, "{s}\n<!-- browdie-js-output -->\n{s}", .{ html, js_output }) catch html;
@@ -65,63 +119,163 @@ pub fn main() !void {
         } else |_| {}
     }
 
-    const stdout = std.fs.File.stdout();
-
-    switch (dump_mode) {
-        .html => stdout.writeAll(html) catch return,
-        .markdown => {
-            const md = try markdown.htmlToMarkdown(html, arena);
-            stdout.writeAll(md) catch return;
-        },
-        .links => {
+    // Convert content based on dump mode
+    const output_content = switch (opts.dump_mode) {
+        .html => html,
+        .markdown => try markdown.htmlToMarkdown(html, arena),
+        .links => blk: {
             const links = try extractLinks(html, arena);
+            var buf: std.ArrayList(u8) = .empty;
+            const w = buf.writer(arena);
             for (links) |link| {
-                stdout.writeAll(link) catch return;
-                stdout.writeAll("\n") catch return;
+                w.writeAll(link) catch break :blk "";
+                w.writeByte('\n') catch break :blk "";
             }
+            break :blk buf.toOwnedSlice(arena) catch "";
         },
-        .text => {
-            const text = try extractText(html, arena);
-            stdout.writeAll(text) catch return;
+        .text => try extractText(html, arena),
+        .json => blk: {
+            const md_content = try markdown.htmlToMarkdown(html, arena);
+            const links = try extractLinks(html, arena);
+            var link_buf: std.ArrayList(u8) = .empty;
+            const lw = link_buf.writer(arena);
+            lw.writeByte('[') catch break :blk "";
+            for (links, 0..) |link, li| {
+                if (li > 0) lw.writeByte(',') catch {};
+                lw.print("\"{s}\"", .{link}) catch {};
+            }
+            lw.writeByte(']') catch {};
+            const link_json = link_buf.toOwnedSlice(arena) catch "[]";
+            const escaped_url = js_engine.escapeForJs(target_url, arena) orelse target_url;
+            const escaped_md = js_engine.escapeForJs(md_content, arena) orelse "";
+            const escaped_html = js_engine.escapeForJs(html, arena) orelse "";
+            break :blk std.fmt.allocPrint(arena,
+                "{{\"url\":\"{s}\",\"status\":200,\"fetch_ms\":{d},\"content_length\":{d},\"markdown\":\"{s}\",\"html\":\"{s}\",\"links\":{s},\"js_enabled\":{s}}}",
+                .{ escaped_url, fetch_ms, html.len, escaped_md, escaped_html, link_json, if (opts.run_js) "true" else "false" },
+            ) catch "";
         },
+    };
+
+    // Write output to file or stdout
+    if (opts.output_file) |path| {
+        const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+            if (color) {
+                std.debug.print("\x1b[31m✗\x1b[0m cannot write to '{s}': {s}\n", .{ path, @errorName(err) });
+            } else {
+                std.debug.print("error: cannot write to '{s}': {s}\n", .{ path, @errorName(err) });
+            }
+            std.process.exit(1);
+        };
+        defer file.close();
+        file.writeAll(output_content) catch |err| {
+            std.debug.print("error: write failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (!opts.quiet) {
+            if (color) {
+                std.debug.print("\x1b[32m✓\x1b[0m wrote {d} bytes to {s} ({s}, {d}ms)\n", .{ output_content.len, path, @tagName(opts.dump_mode), fetch_ms });
+            } else {
+                std.debug.print("wrote {d} bytes to {s} ({s}, {d}ms)\n", .{ output_content.len, path, @tagName(opts.dump_mode), fetch_ms });
+            }
+        }
+    } else {
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(output_content) catch {};
+        // Summary to stderr (not polluting stdout pipe)
+        if (!opts.quiet) {
+            if (color) {
+                std.debug.print("\x1b[32m✓\x1b[0m {d} bytes ({s}, {d}ms)\n", .{ output_content.len, @tagName(opts.dump_mode), fetch_ms });
+            } else {
+                std.debug.print("done: {d} bytes ({s}, {d}ms)\n", .{ output_content.len, @tagName(opts.dump_mode), fetch_ms });
+            }
+        }
     }
 }
 
-const DumpMode = enum { markdown, html, links, text };
+fn elapsed(start: i128) u64 {
+    const diff = std.time.nanoTimestamp() - start;
+    return if (diff > 0) @as(u64, @intCast(diff)) / std.time.ns_per_ms else 0;
+}
+
+fn shouldUseColor(force_no_color: bool) bool {
+    if (force_no_color) return false;
+    if (std.posix.getenv("NO_COLOR")) |v| {
+        if (v.len > 0) return false;
+    }
+    if (std.posix.getenv("TERM")) |term| {
+        if (std.mem.eql(u8, term, "dumb")) return false;
+    }
+    return std.posix.isatty(std.fs.File.stderr().handle);
+}
+
+const Options = struct {
+    dump_mode: DumpMode = .markdown,
+    url: ?[]const u8 = null,
+    run_js: bool = false,
+    quiet: bool = false,
+    no_color: bool = false,
+    output_file: ?[]const u8 = null,
+    user_agent: []const u8 = "browdie-fetch/" ++ version,
+};
+
+const DumpMode = enum { markdown, html, links, text, json };
 
 fn parseDumpMode(s: []const u8) ?DumpMode {
     if (std.mem.eql(u8, s, "markdown") or std.mem.eql(u8, s, "md")) return .markdown;
     if (std.mem.eql(u8, s, "html")) return .html;
     if (std.mem.eql(u8, s, "links")) return .links;
     if (std.mem.eql(u8, s, "text")) return .text;
+    if (std.mem.eql(u8, s, "json")) return .json;
     return null;
 }
 
 fn fatal(msg: []const u8) noreturn {
     std.debug.print("error: {s}\n", .{msg});
+    std.debug.print("Run 'browdie-fetch --help' for usage.\n", .{});
     std.process.exit(1);
 }
 
 fn printUsage() void {
     std.debug.print(
-        \\browdie-fetch — standalone HTTP fetcher (no Chrome needed)
         \\
-        \\Usage: browdie-fetch [--dump markdown|html|links|text] [--js] URL
+        \\  browdie-fetch 🧁 — lightweight HTTP fetcher (no Chrome needed)
         \\
-        \\Options:
-        \\  --dump, -d   Output format (default: markdown)
-        \\               markdown  Convert HTML to Markdown
-        \\               html      Raw HTML
-        \\               links     Extract all <a href> links
-        \\               text      Plain text (tags stripped)
-        \\  --js, -j     Execute inline <script> tags via QuickJS
-        \\  --help, -h   Show this help
+        \\  USAGE
+        \\    browdie-fetch [options] <url>
+        \\
+        \\  OUTPUT FORMATS
+        \\    -d, --dump <fmt>   Output format (default: markdown)
+        \\                         markdown   Convert HTML → Markdown
+        \\                         html       Raw HTML
+        \\                         links      Extract all <a href> links
+        \\                         text       Plain text (tags stripped)
+        \\                         json       Structured JSON output
+        \\        --json         Shorthand for --dump json
+        \\
+        \\  OPTIONS
+        \\    -j, --js           Execute inline <script> tags via QuickJS
+        \\    -o, --output <f>   Write output to file instead of stdout
+        \\    -U, --user-agent   Set custom User-Agent header
+        \\    -q, --quiet        Suppress status messages on stderr
+        \\        --no-color     Disable colored output
+        \\    -V, --version      Print version and exit
+        \\    -h, --help         Show this help
+        \\
+        \\  EXAMPLES
+        \\    browdie-fetch https://example.com
+        \\    browdie-fetch -d links https://news.ycombinator.com
+        \\    browdie-fetch --json --js https://example.com
+        \\    browdie-fetch -o page.md https://example.com
+        \\    browdie-fetch -d text https://example.com | wc -w
+        \\
+        \\  ENVIRONMENT
+        \\    NO_COLOR   Disable colors (https://no-color.org)
         \\
     , .{});
 }
 
 /// Fetch a URL using std.http.Client and return the response body.
-pub fn fetchHttp(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
+pub fn fetchHttp(allocator: std.mem.Allocator, url: []const u8, user_agent: []const u8) ![]const u8 {
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
@@ -129,7 +283,7 @@ pub fn fetchHttp(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
 
     var req = try client.request(.GET, uri, .{
         .extra_headers = &.{
-            .{ .name = "User-Agent", .value = "browdie-fetch/0.1" },
+            .{ .name = "User-Agent", .value = user_agent },
             .{ .name = "Accept", .value = "text/html,application/xhtml+xml,*/*" },
             .{ .name = "Accept-Encoding", .value = "gzip, deflate" },
         },
@@ -162,7 +316,6 @@ pub fn extractLinks(html: []const u8, allocator: std.mem.Allocator) ![]const []c
     var i: usize = 0;
 
     while (i < html.len) {
-        // Find next <a
         const tag_start = std.mem.indexOfPos(u8, html, i, "<a ") orelse
             std.mem.indexOfPos(u8, html, i, "<a\t") orelse
             std.mem.indexOfPos(u8, html, i, "<A ") orelse
@@ -190,7 +343,6 @@ fn findAttrValue(tag: []const u8, attr: []const u8) ?[]const u8 {
         const eq_pos = attr_pos + attr.len;
         if (eq_pos >= tag.len) return null;
 
-        // Skip whitespace around =
         var j = eq_pos;
         while (j < tag.len and tag[j] == ' ') : (j += 1) {}
         if (j >= tag.len or tag[j] != '=') {
@@ -207,7 +359,6 @@ fn findAttrValue(tag: []const u8, attr: []const u8) ?[]const u8 {
             const end = std.mem.indexOfScalarPos(u8, tag, start, quote) orelse return null;
             return tag[start..end];
         } else {
-            // Unquoted value — runs until space or >
             const start = j;
             var end = start;
             while (end < tag.len and tag[end] != ' ' and tag[end] != '>' and tag[end] != '\t') : (end += 1) {}
@@ -236,19 +387,16 @@ pub fn extractText(html: []const u8, allocator: std.mem.Allocator) ![]const u8 {
             const is_close = tag_content.len > 0 and tag_content[0] == '/';
             const raw_name = if (is_close) tag_content[1..] else tag_content;
 
-            // Extract just the tag name (before space//)
             var name_end: usize = 0;
             while (name_end < raw_name.len and raw_name[name_end] != ' ' and raw_name[name_end] != '/' and raw_name[name_end] != '>') : (name_end += 1) {}
             const tag_name = raw_name[0..name_end];
 
-            // Check script/style boundaries
             if (eqlIgnoreCase(tag_name, "script")) {
                 in_script = !is_close;
             } else if (eqlIgnoreCase(tag_name, "style")) {
                 in_style = !is_close;
             }
 
-            // Add whitespace for block elements
             if (is_close and isBlockElement(tag_name)) {
                 try writer.writeByte('\n');
             }
@@ -312,6 +460,7 @@ test "parseDumpMode" {
     try std.testing.expectEqual(DumpMode.html, parseDumpMode("html").?);
     try std.testing.expectEqual(DumpMode.links, parseDumpMode("links").?);
     try std.testing.expectEqual(DumpMode.text, parseDumpMode("text").?);
+    try std.testing.expectEqual(DumpMode.json, parseDumpMode("json").?);
     try std.testing.expect(parseDumpMode("invalid") == null);
 }
 
@@ -374,6 +523,10 @@ test "findAttrValue single quotes" {
 
 test "findAttrValue not found" {
     try std.testing.expect(findAttrValue("a class=\"x\"", "href") == null);
+}
+
+test "shouldUseColor respects --no-color" {
+    try std.testing.expect(!shouldUseColor(true));
 }
 
 test {
