@@ -10,6 +10,7 @@ const middleware = @import("middleware.zig");
 const json_util = @import("../util/json.zig");
 const protocol = @import("../cdp/protocol.zig");
 const HarRecorder = @import("../cdp/har.zig").HarRecorder;
+const CdpClient = @import("../cdp/client.zig").CdpClient;
 
 pub fn run(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config) !void {
     const address = try net.Address.parseIp4(cfg.host, cfg.port);
@@ -304,6 +305,25 @@ fn handleNavigate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
             resp.sendError(request, 404, "Tab not found");
             return;
         };
+        // Drain any pending events from the WebSocket after navigate
+        // (Network events arrive after the navigate response)
+        if (bridge.getHarRecorder(tid)) |rec| {
+            if (rec.isRecording()) {
+                const short_timeout = std.posix.timeval{ .sec = 1, .usec = 0 };
+                const orig_timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
+                if (client.ws) |*ws| {
+                    std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&short_timeout)) catch {};
+                    var drained: u32 = 0;
+                    while (drained < 200) : (drained += 1) {
+                        const msg = ws.receiveMessageAlloc(arena, 2 * 1024 * 1024) catch break;
+                        rec.handleCdpEvent(msg);
+                        client.event_buf.push(msg);
+                    }
+                    std.log.info("navigate: drained {d} events after response", .{drained});
+                    std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&orig_timeout)) catch {};
+                }
+            }
+        }
         const params = std.fmt.allocPrint(arena, "{{\"url\":\"{s}\"}}", .{url}) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
@@ -911,8 +931,11 @@ fn handleHarStart(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         return;
     };
 
-    // If we have a CDP client, enable Network domain
+    // If we have a CDP client, enable Network domain and wire HAR recording
     if (bridge.getCdpClient(tab_id)) |client| {
+        // Wire the HAR recorder to the CDP client so events are captured in real-time
+        // HAR recorder is wired via event drain in navigate/evaluate handlers
+
         rec.start(client) catch {
             // Continue even if Network.enable fails — we can still manually add entries
         };
@@ -939,14 +962,48 @@ fn handleHarStop(request: *std.http.Server.Request, arena: std.mem.Allocator, br
         return;
     };
 
-    // Stop recording — disable Network domain if we have a CDP client
+    // Flush buffered CDP events and disconnect HAR recorder from CDP client.
     if (bridge.getCdpClient(tab_id)) |client| {
+        // Disconnect HAR recorder from real-time event feeding
+        // HAR recorder disconnect handled by stop()
+        // First: read all pending WebSocket messages with a short timeout.
+        // Network events arrive asynchronously and queue on the WebSocket.
+        if (client.ws) |*ws| {
+            const short_timeout = std.posix.timeval{ .sec = 0, .usec = 500_000 };
+            const orig_timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
+            std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&short_timeout)) catch {};
+
+            var flush_read: u32 = 0;
+            while (flush_read < 200) : (flush_read += 1) {
+                const msg = ws.receiveMessageAlloc(arena, 2 * 1024 * 1024) catch break;
+                rec.handleCdpEvent(msg);
+                client.event_buf.push(msg);
+            }
+            std.log.info("HAR: read {d} pending WS messages", .{flush_read});
+
+            std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&orig_timeout)) catch {};
+        }
+
+        // Second: flush any events already in the buffer from prior send() calls
+        flushEventsToHar(client, rec);
+
+        // Third: stop recording (sends Network.disable, which may read more events)
         const har_json = rec.stop(client) catch {
             resp.sendError(request, 500, "Failed to generate HAR");
             return;
         };
+
+        // Fourth: flush again — stop() may have buffered more events during Network.disable
+        flushEventsToHar(client, rec);
+
         defer rec.allocator.free(har_json);
-        const result = std.fmt.allocPrint(arena, "{{\"status\":\"stopped\",\"entries\":{d},\"har\":{s}}}", .{ rec.entryCount(), har_json }) catch {
+        // Re-serialize since we may have added entries after stop
+        const final_json = rec.toJson() catch {
+            resp.sendError(request, 500, "Failed to generate HAR");
+            return;
+        };
+        defer rec.allocator.free(final_json);
+        const result = std.fmt.allocPrint(arena, "{{\"status\":\"stopped\",\"entries\":{d},\"har\":{s}}}", .{ rec.entryCount(), final_json }) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
@@ -964,6 +1021,21 @@ fn handleHarStop(request: *std.http.Server.Request, arena: std.mem.Allocator, br
         };
         resp.sendJson(request, result);
     }
+}
+
+/// Feed all buffered CDP events from the client's event buffer to the HAR recorder.
+fn flushEventsToHar(client: *CdpClient, rec: *HarRecorder) void {
+    std.log.info("HAR flush: {d} buffered events", .{client.event_buf.len});
+    var network_events: usize = 0;
+    for (client.event_buf.items[0..client.event_buf.len]) |item| {
+        if (item) |ev| {
+            if (std.mem.indexOf(u8, ev, "Network.") != null) {
+                network_events += 1;
+            }
+            rec.handleCdpEvent(ev);
+        }
+    }
+    std.log.info("HAR flush: {d} network events fed to recorder", .{network_events});
 }
 
 fn handleHarStatus(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {

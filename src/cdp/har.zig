@@ -177,14 +177,23 @@ pub const HarRecorder = struct {
             const request_id = extractField(event_json, "requestId") orelse return;
             const pending = self.pending_requests.get(request_id) orelse return;
 
+            // Extract status and mimeType from the response object
+            const status_str = extractField(event_json, "status");
+            const status: u16 = if (status_str) |s|
+                std.fmt.parseInt(u16, s, 10) catch 200
+            else
+                200;
+            const mime = extractField(event_json, "mimeType") orelse "application/octet-stream";
+            const status_text = if (status >= 200 and status < 300) "OK" else if (status >= 300 and status < 400) "Redirect" else if (status >= 400) "Error" else "Unknown";
+
             self.addEntry(.{
                 .url = pending.url,
                 .method = pending.method,
-                .status = 200,
-                .status_text = "OK",
-                .mime_type = "application/octet-stream",
+                .status = status,
+                .status_text = status_text,
+                .mime_type = mime,
                 .timestamp = pending.timestamp,
-                .duration_ms = 0,
+                .duration_ms = std.time.timestamp() - pending.timestamp,
                 .request_size = 0,
                 .response_size = 0,
             }) catch return;
