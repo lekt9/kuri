@@ -1,32 +1,23 @@
-/// kuri-agent — scriptable CLI for Chrome automation via CDP
+/// kuri-agent — agentic Chrome CLI via CDP
 ///
 /// Usage: kuri-agent <command> [args...]
 ///
-/// Session (~/.kuri/session.json) stores: cdp_url, refs (ref→backendNodeId map).
-/// Commands read/write the session so multiple invocations share state.
+/// Session (~/.kuri/session.json): cdp_url, refs (ref→backendNodeId), extra_headers.
+/// Commands share state across invocations. Refs set by `snap`, used by click/type/etc.
 ///
-///   tabs [--port N]            list Chrome tabs (default port 9222)
-///   use <ws_url>               attach to a tab (save to session)
-///   go <url>                   navigate current tab
-///   snap [--interactive] [--semantic] [--all] [--json] [--text] [--depth N]  a11y snapshot
-///   click <ref>                click element by @eN ref
-///   type <ref> <text>          type into element
-///   fill <ref> <text>          fill input value
-///   select <ref> <value>       select dropdown option
-///   hover <ref>                hover over element
-///   focus <ref>                focus element
-///   scroll                     scroll down
-///   eval <js>                  evaluate JavaScript
-///   text [selector]            get page text
-///   shot [--out <file>]        screenshot (saves PNG, prints path)
-///   back                       navigate back
-///   forward                    navigate forward
-///   reload                     reload page
-///   status                     show current session
-///   cookies                    list cookies with security flags
-///   headers                    check security response headers
-///   audit                      security audit (headers + cookies + HTTPS)
-
+/// Snapshot output (default: compact text-tree, ~2k tokens on real pages):
+///   snap                       compact text-tree: role "name" @ref  ← DEFAULT
+///   snap --interactive         only interactive elements (~1.3k tokens)
+///   snap --semantic            headings + interactive roles only
+///   snap --all                 full tree, no filtering (~17k tokens)
+///   snap --json                JSON array (old default, ~39k tokens)
+///   snap --text                plain innerText dump
+///   snap --depth N             limit tree depth
+///
+/// Navigation:  go <url>  back  forward  reload
+/// Actions:     click <ref>  type <ref> <text>  fill  select  hover  focus  scroll
+/// Inspection:  text [sel]  eval <js>  shot [--out file.png]
+/// Security:    cookies  headers  audit  storage  jwt  fetch  probe  set-header
 
 const std = @import("std");
 const CdpClient = @import("cdp/client.zig").CdpClient;
@@ -1051,13 +1042,16 @@ fn printUsage() void {
         \\  forward                      go forward
         \\  reload                       reload page
         \\
+        \\Snapshot (a11y tree — refs used by click/type/etc.):
+        \\  snap                         compact text-tree  ← DEFAULT (~2k tokens)
+        \\  snap --interactive           only interactive elements (~1.3k tokens)
+        \\  snap --semantic              headings + interactive roles
+        \\  snap --all                   full tree, no filtering (~17k tokens)
+        \\  snap --json                  JSON array output (old default, ~39k tokens)
+        \\  snap --text                  plain innerText dump
+        \\  snap --depth N               limit tree depth
+        \\
         \\Page inspection:
-        \\  snap [--interactive] [--semantic] [--all] [--json] [--text] [--depth N]
-        \\                               a11y snapshot — compact text-tree by default
-        \\                               --interactive: only interactive elements
-        \\                               --semantic: filter noise roles (headings+interactive)
-        \\                               --all: no filtering, full raw tree
-        \\                               --json: JSON array output (backward compat)
         \\  text [css-selector]          get page text
         \\  eval <js>                    evaluate JavaScript
         \\  shot [--out <file.png>]      take screenshot
