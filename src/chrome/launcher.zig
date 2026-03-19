@@ -13,6 +13,7 @@ pub const Launcher = struct {
     restarts: u8,
     mode: Mode,
     extensions: ?[]const u8,
+    headless: bool,
 
     pub const Mode = enum {
         managed, // we launched Chrome ourselves
@@ -52,6 +53,7 @@ pub const Launcher = struct {
             .restarts = 0,
             .mode = mode,
             .extensions = cfg.extensions,
+            .headless = cfg.headless,
         };
     }
 
@@ -94,13 +96,20 @@ pub const Launcher = struct {
         ) catch unreachable;
         const port_flag_len = port_flag.len;
 
-        // Build argv with optional extension flags
+        // Build argv
         var argv_list: std.ArrayList([]const u8) = .empty;
         defer argv_list.deinit(self.allocator);
 
         try argv_list.append(self.allocator, chrome_bin);
-        try argv_list.append(self.allocator, "--headless=new");
-        try argv_list.append(self.allocator, "--disable-gpu");
+        if (self.headless) {
+            try argv_list.append(self.allocator, "--headless=new");
+            try argv_list.append(self.allocator, "--disable-gpu");
+        } else {
+            // Visible mode: needs a data dir for CDP to work on macOS
+            const home = std.posix.getenv("HOME") orelse "/tmp";
+            const data_dir = try std.fmt.allocPrint(self.allocator, "--user-data-dir={s}/.kuri/chrome-profile", .{home});
+            try argv_list.append(self.allocator, data_dir);
+        }
         try argv_list.append(self.allocator, "--no-sandbox");
         try argv_list.append(self.allocator, self.ws_url_buf[0..port_flag_len]);
 
