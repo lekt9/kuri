@@ -33,8 +33,8 @@ pub const Bridge = struct {
     tabs: std.StringHashMap(TabEntry),
     snapshots: std.StringHashMap(RefCache),
     prev_snapshots: std.StringHashMap([]const A11yNode),
-    cdp_clients: std.StringHashMap(CdpClient),
-    har_recorders: std.StringHashMap(HarRecorder),
+    cdp_clients: std.StringHashMap(*CdpClient),
+    har_recorders: std.StringHashMap(*HarRecorder),
     mu: std.Thread.RwLock,
 
     pub fn init(allocator: std.mem.Allocator) Bridge {
@@ -43,8 +43,8 @@ pub const Bridge = struct {
             .tabs = std.StringHashMap(TabEntry).init(allocator),
             .snapshots = std.StringHashMap(RefCache).init(allocator),
             .prev_snapshots = std.StringHashMap([]const A11yNode).init(allocator),
-            .cdp_clients = std.StringHashMap(CdpClient).init(allocator),
-            .har_recorders = std.StringHashMap(HarRecorder).init(allocator),
+            .cdp_clients = std.StringHashMap(*CdpClient).init(allocator),
+            .har_recorders = std.StringHashMap(*HarRecorder).init(allocator),
             .mu = .{},
         };
     }
@@ -52,13 +52,15 @@ pub const Bridge = struct {
     pub fn deinit(self: *Bridge) void {
         var har_it = self.har_recorders.valueIterator();
         while (har_it.next()) |rec| {
-            rec.deinit();
+            rec.*.deinit();
+            self.allocator.destroy(rec.*);
         }
         self.har_recorders.deinit();
 
         var cdp_it = self.cdp_clients.valueIterator();
         while (cdp_it.next()) |client| {
-            client.deinit();
+            client.*.deinit();
+            self.allocator.destroy(client.*);
         }
         self.cdp_clients.deinit();
 
@@ -133,10 +135,14 @@ pub const Bridge = struct {
             if (self.snapshots.getPtr(tab_id)) |cache| cache.deinit();
             _ = self.snapshots.remove(tab_id);
             _ = self.prev_snapshots.remove(tab_id);
-            if (self.cdp_clients.getPtr(tab_id)) |client| client.deinit();
-            _ = self.cdp_clients.remove(tab_id);
-            if (self.har_recorders.getPtr(tab_id)) |rec| rec.deinit();
-            _ = self.har_recorders.remove(tab_id);
+            if (self.cdp_clients.fetchRemove(tab_id)) |kv| {
+                kv.value.deinit();
+                self.allocator.destroy(kv.value);
+            }
+            if (self.har_recorders.fetchRemove(tab_id)) |kv| {
+                kv.value.deinit();
+                self.allocator.destroy(kv.value);
+            }
             return;
         };
 
@@ -150,10 +156,14 @@ pub const Bridge = struct {
         if (self.snapshots.getPtr(tab_id)) |cache| cache.deinit();
         _ = self.snapshots.remove(tab_id);
         _ = self.prev_snapshots.remove(tab_id);
-        if (self.cdp_clients.getPtr(tab_id)) |client| client.deinit();
-        _ = self.cdp_clients.remove(tab_id);
-        if (self.har_recorders.getPtr(tab_id)) |rec| rec.deinit();
-        _ = self.har_recorders.remove(tab_id);
+        if (self.cdp_clients.fetchRemove(tab_id)) |kv| {
+            kv.value.deinit();
+            self.allocator.destroy(kv.value);
+        }
+        if (self.har_recorders.fetchRemove(tab_id)) |kv| {
+            kv.value.deinit();
+            self.allocator.destroy(kv.value);
+        }
     }
 
     pub fn listTabs(self: *Bridge, allocator: std.mem.Allocator) ![]TabEntry {
@@ -169,20 +179,25 @@ pub const Bridge = struct {
     }
 
     /// Get or create a CDP client for a tab.
+    /// Returns a stable heap-allocated pointer that survives HashMap resizes.
     pub fn getCdpClient(self: *Bridge, tab_id: []const u8) ?*CdpClient {
         self.mu.lock();
         defer self.mu.unlock();
 
-        if (self.cdp_clients.getPtr(tab_id)) |client| {
+        if (self.cdp_clients.get(tab_id)) |client| {
             return client;
         }
 
         const tab = self.tabs.get(tab_id) orelse return null;
         if (tab.ws_url.len == 0) return null;
 
-        const client = CdpClient.init(self.allocator, tab.ws_url);
-        self.cdp_clients.put(tab_id, client) catch return null;
-        return self.cdp_clients.getPtr(tab_id);
+        const client = self.allocator.create(CdpClient) catch return null;
+        client.* = CdpClient.init(self.allocator, tab.ws_url);
+        self.cdp_clients.put(tab_id, client) catch {
+            self.allocator.destroy(client);
+            return null;
+        };
+        return client;
     }
 
     pub fn exportState(self: *Bridge, allocator: std.mem.Allocator) ![]const u8 {
@@ -247,17 +262,22 @@ pub const Bridge = struct {
     }
 
     /// Get or create a HAR recorder for a tab.
+    /// Returns a stable heap-allocated pointer that survives HashMap resizes.
     pub fn getHarRecorder(self: *Bridge, tab_id: []const u8) ?*HarRecorder {
         self.mu.lock();
         defer self.mu.unlock();
 
-        if (self.har_recorders.getPtr(tab_id)) |rec| {
+        if (self.har_recorders.get(tab_id)) |rec| {
             return rec;
         }
 
-        const rec = HarRecorder.init(self.allocator);
-        self.har_recorders.put(tab_id, rec) catch return null;
-        return self.har_recorders.getPtr(tab_id);
+        const rec = self.allocator.create(HarRecorder) catch return null;
+        rec.* = HarRecorder.init(self.allocator);
+        self.har_recorders.put(tab_id, rec) catch {
+            self.allocator.destroy(rec);
+            return null;
+        };
+        return rec;
     }
 };
 
