@@ -263,69 +263,74 @@ fn cmdUse(arena: std.mem.Allocator, ws_url: []const u8) !void {
 /// Launch a visible (non-headless) Chrome with CDP, wait for it, auto-attach.
 /// This is the "human mode" — real browser, real user, agent rides alongside.
 fn cmdOpen(arena: std.mem.Allocator, port: u16, url: ?[]const u8) !void {
-    // Check if Chrome is already running on this port
-    const existing = fetchChromeTabs(arena, "127.0.0.1", port) catch null;
-    if (existing) |json| {
-        // Already running — just attach to first tab
-        if (extractString(json, 0, "\"webSocketDebuggerUrl\"")) |ws| {
-            const type_val = extractString(json, 0, "\"type\"") orelse "page";
-            if (std.mem.eql(u8, type_val, "page")) {
-                // Navigate if URL provided
-                if (url) |u| {
-                    var session = Session.init(arena);
-                    session.cdp_url = try arena.dupe(u8, ws);
-                    try saveSession(arena, &session);
-                    var client = CdpClient.init(arena, ws);
-                    defer client.deinit();
-                    try cmdNavigate(arena, &client, u);
-                }
-                try cmdUse(arena, ws);
-                return;
-            }
-        }
-    }
+    // 1. Check if Chrome CDP is already available on this port
+    if (tryAttach(arena, port, url)) return;
 
-    // Find Chrome binary
+    // 2. Not running — launch visible Chrome with CDP
     const chrome_bin: []const u8 = switch (@import("builtin").os.tag) {
         .macos => "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        else => blk: {
-            // Try common Linux paths
-            const paths = [_][]const u8{ "google-chrome", "chromium-browser", "chromium" };
-            for (paths) |p| {
-                if (std.fs.cwd().access(p, .{})) |_| {
-                    break :blk p;
-                } else |_| {}
-            }
-            break :blk "google-chrome";
-        },
+        else => "google-chrome",
     };
 
-    // Build args: visible Chrome (NOT headless) with CDP port
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(arena, chrome_bin);
     const port_flag = try std.fmt.allocPrint(arena, "--remote-debugging-port={d}", .{port});
     try argv.append(arena, port_flag);
     if (url) |u| try argv.append(arena, u);
 
-    // Spawn Chrome in background
     var child = std.process.Child.init(argv.items, arena);
-    try child.spawn();
+    child.spawn() catch {
+        fatal("Failed to launch Chrome. Is it installed?\n", .{});
+    };
 
-    // Wait for CDP to come up (poll /json)
-    std.debug.print("Launching Chrome (port {d})...\n", .{port});
+    // 3. Poll for CDP — try the requested port first, then fall back to 9222
+    std.debug.print("Launching Chrome...\n", .{});
+    const ports_to_try = if (port != DEFAULT_CDP_PORT)
+        &[_]u16{ port, DEFAULT_CDP_PORT }
+    else
+        &[_]u16{port};
+
     var attempts: u32 = 0;
     while (attempts < 30) : (attempts += 1) {
         std.Thread.sleep(500_000_000);
-        const json = fetchChromeTabs(arena, "127.0.0.1", port) catch continue;
-        if (extractString(json, 0, "\"webSocketDebuggerUrl\"")) |ws| {
-            const type_val = extractString(json, 0, "\"type\"") orelse "page";
-            if (std.mem.eql(u8, type_val, "page")) {
-                try cmdUse(arena, ws);
-                return;
-            }
+        for (ports_to_try) |p| {
+            if (tryAttach(arena, p, url)) return;
         }
     }
     fatal("Chrome didn't start within 15s. Is it installed?\n", .{});
+}
+
+/// Try to connect to Chrome on the given port, optionally navigate, and save session.
+fn tryAttach(arena: std.mem.Allocator, port: u16, url: ?[]const u8) bool {
+    const json = fetchChromeTabs(arena, "127.0.0.1", port) catch return false;
+
+    // Find the first page target
+    var pos: usize = 0;
+    while (pos < json.len) {
+        const ws_start = std.mem.indexOfPos(u8, json, pos, "\"webSocketDebuggerUrl\"") orelse break;
+        const ws = extractString(json, ws_start, "\"webSocketDebuggerUrl\"") orelse {
+            pos = ws_start + 1;
+            continue;
+        };
+        const type_val = extractString(json, pos, "\"type\"") orelse "page";
+        if (!std.mem.eql(u8, type_val, "page")) {
+            pos = ws_start + ws.len + 1;
+            continue;
+        }
+
+        // Found a page tab — navigate if URL given, then attach
+        if (url) |u| {
+            var session = Session.init(arena);
+            session.cdp_url = arena.dupe(u8, ws) catch return false;
+            saveSession(arena, &session) catch {};
+            var client = CdpClient.init(arena, ws);
+            defer client.deinit();
+            cmdNavigate(arena, &client, u) catch {};
+        }
+        cmdUse(arena, ws) catch {};
+        return true;
+    }
+    return false;
 }
 
 
