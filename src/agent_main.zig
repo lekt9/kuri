@@ -1,24 +1,14 @@
-/// kuri-agent — agentic Chrome CLI via CDP
+/// kuri-agent — drive Chrome from the command line
 ///
-/// Usage: kuri-agent <command> [args...]
+/// Stateless CLI: each command connects via CDP, acts, disconnects.
+/// Session (~/.kuri/session.json) persists: tab, refs, headers, stealth.
 ///
-/// Session (~/.kuri/session.json): cdp_url, refs (ref→backendNodeId), extra_headers.
-/// Commands share state across invocations. Refs set by `snap`, used by click/type/etc.
+///   tabs → use <ws> → go <url> → snap → click @e3 → snap → ...
 ///
-/// Snapshot output (default: compact text-tree, ~2k tokens on real pages):
-///   snap                       compact text-tree: role "name" @ref  ← DEFAULT
-///   snap --interactive         only interactive elements (~1.3k tokens)
-///   snap --semantic            headings + interactive roles only
-///   snap --all                 full tree, no filtering (~17k tokens)
-///   snap --json                JSON array (old default, ~39k tokens)
-///   snap --text                plain innerText dump
-///   snap --depth N             limit tree depth
-///
-/// Navigation:  go <url>  back  forward  reload
-/// Actions:     click <ref>  type <ref> <text>  fill  select  hover  focus  scroll
-/// Tab follow:  grab <ref>  wait-for-tab — click-and-follow popups, detect new tabs
-/// Security:    cookies  headers  audit  storage  jwt  fetch  probe  set-header
-
+/// Key commands:
+///   snap          a11y tree (~2k tokens)    snap --interactive (~1.3k)
+///   click/type    act on @ref from snap     grab <ref> follows popups
+///   stealth       anti-bot patches          cookies/headers/audit for security
 const std = @import("std");
 const CdpClient = @import("cdp/client.zig").CdpClient;
 const protocol = @import("cdp/protocol.zig");
@@ -1269,65 +1259,59 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 
 fn printUsage() void {
     std.debug.print(
-        \\kuri-agent — agentic Chrome CLI
+        \\kuri-agent — drive Chrome from the command line
         \\
-        \\Usage: kuri-agent <command> [args...]
+        \\  kuri-agent tabs                 find Chrome tabs
+        \\  kuri-agent use <ws_url>         attach to a tab
+        \\  kuri-agent go <url>             navigate
+        \\  kuri-agent snap                 page snapshot (a11y tree, ~2k tokens)
+        \\  kuri-agent click <ref>          click element from snapshot
+        \\  kuri-agent type <ref> <text>    type into element
         \\
-        \\Discovery:
-        \\  tabs [--port N]              list Chrome tabs (default: 9222)
-        \\  use <ws_url>                 attach to a tab, save to session
-        \\  status                       show current session
+        \\Setup:
+        \\  tabs [--port N]        list Chrome tabs (default port 9222)
+        \\  use <ws_url>           attach to a tab
+        \\  status                 show session
+        \\  stealth                anti-bot mode (persists across commands)
         \\
-        \\Navigation:
-        \\  go <url>                     navigate to URL
-        \\  back                         go back
-        \\  forward                      go forward
-        \\  reload                       reload page
+        \\Navigate:
+        \\  go <url>               open URL
+        \\  back / forward         history navigation
+        \\  reload                 reload page
         \\
-        \\Snapshot (a11y tree — refs used by click/type/etc.):
-        \\  snap                         compact text-tree  ← DEFAULT (~2k tokens)
-        \\  snap --interactive           only interactive elements (~1.3k tokens)
-        \\  snap --semantic              headings + interactive roles
-        \\  snap --all                   full tree, no filtering (~17k tokens)
-        \\  snap --json                  JSON array output (old default, ~39k tokens)
-        \\  snap --text                  plain innerText dump
-        \\  snap --depth N               limit tree depth
+        \\Read:
+        \\  snap [flags]           a11y snapshot — compact text-tree by default
+        \\    --interactive          only buttons, links, inputs (~1.3k tokens)
+        \\    --json / --text        alternate formats
+        \\    --depth N              limit depth
+        \\  text [selector]        page text (or CSS-selected text)
+        \\  shot [--out file.png]  screenshot
+        \\  eval <js>              run JavaScript
         \\
-        \\Page inspection:
-        \\  text [css-selector]          get page text
-        \\  eval <js>                    evaluate JavaScript
-        \\  shot [--out <file.png>]      take screenshot
-        \\
-        \\Actions (require a prior `snap`):
-        \\  click <ref>                  click element (@e3 or e3)
-        \\  type <ref> <text>            type text into element
-        \\  fill <ref> <text>            fill input value
-        \\  select <ref> <value>         select dropdown option
-        \\  hover <ref>                  hover over element
-        \\  focus <ref>                  focus element
-        \\  scroll                       scroll down 500px
-        \\  viewport mobile|tablet|desktop|<w> <h>  set viewport size
-        \\  grab <ref>                   click + follow redirect in-tab (bypasses popups)
-        \\  wait-for-tab [--port N]      poll for new tab, auto-switch to it
-        \\  stealth                      apply anti-bot patches (UA override + stealth.js)
+        \\Act:
+        \\  click <ref>            click (use @e3 or e3 from snap)
+        \\  type <ref> <text>      type text
+        \\  fill <ref> <text>      clear + fill
+        \\  select <ref> <value>   dropdown
+        \\  hover / focus <ref>    hover or focus
+        \\  scroll                 scroll down
+        \\  grab <ref>             click + follow popup redirect in-tab
         \\
         \\Security:
-        \\  cookies                      list cookies with Secure/HttpOnly/SameSite flags
-        \\  headers                      check security response headers (CSP, HSTS, etc.)
-        \\  audit                        full security audit: HTTPS, headers, JS-visible cookies
-        \\  storage [local|session|all]  dump localStorage / sessionStorage
-        \\  jwt                          scan storage+cookies for JWTs, decode payloads
-        \\  fetch <method> <url>         authenticated fetch (uses session cookies + headers)
-        \\    [--data <json>]            optional request body
-        \\  probe <url-template> <N> <M> IDOR probe: replace {{id}} with N..M, report status
+        \\  cookies                cookies with security flags
+        \\  headers                response header audit
+        \\  audit                  full security scan
+        \\  storage [local|session] dump web storage
+        \\  jwt                    find + decode JWTs
+        \\  fetch <GET|POST> <url> fetch as the browser (with cookies)
+        \\  probe <url/{{id}}> <N> <M>  IDOR enumeration
         \\
-        \\Auth headers (persisted in session):
-        \\  set-header <name> <value>    add/update a request header (e.g. Authorization)
-        \\  clear-headers                remove all stored extra headers
-        \\  show-headers                 print stored extra headers
+        \\Headers (persisted):
+        \\  set-header <k> <v>     add auth header (e.g. Authorization)
+        \\  clear-headers          remove all
+        \\  show-headers           print current
         \\
-        \\Session stored at: ~/.kuri/session.json
+        \\Session: ~/.kuri/session.json
         \\
-
     , .{});
 }
