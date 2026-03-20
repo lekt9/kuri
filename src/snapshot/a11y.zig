@@ -147,8 +147,8 @@ pub fn buildSnapshot(
 
         const ref = try std.fmt.allocPrint(allocator, "e{d}", .{result.items.len});
 
-        // Truncate name at 120 chars
-        const name = if (node.name.len > 120) node.name[0..120] else node.name;
+        // Truncate name — 70 chars captures all useful info without waste
+        const name = if (node.name.len > 70) node.name[0..70] else node.name;
 
         try result.append(allocator, .{
             .ref = ref,
@@ -179,6 +179,12 @@ pub fn buildSnapshot(
                 if (trimmed.len <= 1) continue;
                 // Drop if text appears in a non-StaticText node's name
                 if (name_set.contains(node.name)) continue;
+                // Drop if mostly non-ASCII (unicode separators, bullets, etc.)
+                var ascii_count: usize = 0;
+                for (trimmed) |c| {
+                    if (c >= 0x20 and c < 0x7f) ascii_count += 1;
+                }
+                if (trimmed.len > 2 and ascii_count * 3 < trimmed.len) continue;
             }
             // Only assign refs to interactive elements — agents only click/type those
             const is_act = isInteractive(node.role);
