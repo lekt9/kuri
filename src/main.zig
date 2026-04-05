@@ -5,6 +5,11 @@ const Bridge = @import("bridge/bridge.zig").Bridge;
 const launcher = @import("chrome/launcher.zig");
 
 pub fn main() !void {
+    // Initialize Winsock on Windows. Required before any socket ops.
+    if (@import("builtin").os.tag == .windows) {
+        _ = std.os.windows.WSAStartup(2, 2) catch {};
+    }
+
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const gpa = gpa_impl.allocator();

@@ -142,6 +142,13 @@ pub const Launcher = struct {
         if (self.headless) {
             try argv_list.append(self.allocator, "--headless=new");
             try argv_list.append(self.allocator, "--disable-gpu");
+            // Windows headless Chrome requires a unique user-data-dir to avoid conflicts
+            // with other Chrome instances. Without it, Chrome exits immediately.
+            if (@import("builtin").os.tag == .windows) {
+                const home = compat.getHomeDir();
+                const data_dir = try std.fmt.allocPrint(self.allocator, "--user-data-dir={s}\\.kuri\\chrome-headless", .{home});
+                try argv_list.append(self.allocator, data_dir);
+            }
         } else {
             // Visible mode: needs a data dir for CDP to work on macOS/Windows
             const home = compat.getHomeDir();
@@ -150,8 +157,6 @@ pub const Launcher = struct {
             try argv_list.append(self.allocator, data_dir);
         }
         try argv_list.append(self.allocator, "--no-sandbox");
-        try argv_list.append(self.allocator, "--remote-allow-origins=*");
-        try argv_list.append(self.allocator, port_flag);
         try argv_list.append(self.allocator, "--remote-allow-origins=*");
         try argv_list.append(self.allocator, port_flag);
 
@@ -310,8 +315,11 @@ pub const Launcher = struct {
     }
 
     fn waitForDebuggerUrl(self: *Launcher) !void {
+        // Windows Chrome startup is slower (UAC, profile init, antivirus scanning).
+        // Use 60 attempts * 250ms = 15s on Windows, 20 * 250ms = 5s elsewhere.
+        const max_attempts: u8 = if (@import("builtin").os.tag == .windows) 60 else 20;
         var attempts: u8 = 0;
-        while (attempts < 20) : (attempts += 1) {
+        while (attempts < max_attempts) : (attempts += 1) {
             const status = self.healthCheck();
             if (status.alive and status.ws_url != null) {
                 try self.storeWsUrl(status.ws_url.?);
@@ -401,8 +409,16 @@ fn httpProbeJsonVersion(port: u16) Launcher.ChromeStatus {
 
 fn httpProbe(raw_url: []const u8, host: []const u8, port: u16, path: []const u8) Launcher.ChromeStatus {
     const connect_host = normalizeHost(host);
-    var stream = std.net.tcpConnectToHost(std.heap.page_allocator, connect_host, port) catch
-        return .{ .alive = false, .ws_url = null };
+    // On Windows, bypass getaddrinfo (which needs WSAStartup) by parsing IP directly
+    // when possible. Falls back to tcpConnectToHost for hostnames.
+    var stream = blk: {
+        const addr = std.net.Address.parseIp4(connect_host, port) catch {
+            break :blk std.net.tcpConnectToHost(std.heap.page_allocator, connect_host, port) catch
+                return .{ .alive = false, .ws_url = null };
+        };
+        break :blk std.net.tcpConnectToAddress(addr) catch
+            return .{ .alive = false, .ws_url = null };
+    };
 
     defer stream.close();
 
