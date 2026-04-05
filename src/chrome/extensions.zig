@@ -1,5 +1,5 @@
 const std = @import("std");
-
+const compat = @import("../compat.zig");
 /// Builtin extension files — embedded at compile time, zero runtime I/O to read them.
 const builtin_manifest = @embedFile("js/extensions/kuri-builtin/manifest.json");
 const builtin_content = @embedFile("js/extensions/kuri-builtin/content.js");
@@ -21,8 +21,9 @@ const builtin_files = [_]BuiltinFile{
 /// so the extension stays in sync with the binary version.
 /// Returns an allocator-owned path string the caller must free.
 pub fn extractBuiltinExtension(allocator: std.mem.Allocator, state_dir: []const u8) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
-    const ext_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/builtin-ext", .{ home, state_dir });
+    const home = compat.getHomeDir();
+    const sep: []const u8 = if (@import("builtin").os.tag == .windows) "\\" else "/";
+    const ext_dir = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}builtin-ext", .{ home, sep, state_dir, sep });
     errdefer allocator.free(ext_dir);
 
     // Ensure directory exists

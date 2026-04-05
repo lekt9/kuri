@@ -1,8 +1,9 @@
 const std = @import("std");
 const config = @import("../bridge/config.zig");
 const extensions_mod = @import("extensions.zig");
+const compat = @import("../compat.zig");
 
-/// 🧁 Chrome lifecycle manager — launch, supervise, restart.
+/// Chrome lifecycle manager — launch, supervise, restart.
 /// Handles spawning headless Chrome with CDP debugging port,
 /// health-checking via /json/version, and auto-restart on crash.
 pub const Launcher = struct {
@@ -47,6 +48,10 @@ pub const Launcher = struct {
     const chrome_paths = switch (@import("builtin").os.tag) {
         .macos => &[_][]const u8{
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        },
+        .windows => &[_][]const u8{
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
         },
         else => &[_][]const u8{
             "chrome",
@@ -138,12 +143,15 @@ pub const Launcher = struct {
             try argv_list.append(self.allocator, "--headless=new");
             try argv_list.append(self.allocator, "--disable-gpu");
         } else {
-            // Visible mode: needs a data dir for CDP to work on macOS
-            const home = std.posix.getenv("HOME") orelse "/tmp";
-            const data_dir = try std.fmt.allocPrint(self.allocator, "--user-data-dir={s}/.kuri/chrome-profile", .{home});
+            // Visible mode: needs a data dir for CDP to work on macOS/Windows
+            const home = compat.getHomeDir();
+            const sep: []const u8 = if (@import("builtin").os.tag == .windows) "\\" else "/";
+            const data_dir = try std.fmt.allocPrint(self.allocator, "--user-data-dir={s}{s}.kuri{s}chrome-profile", .{ home, sep, sep });
             try argv_list.append(self.allocator, data_dir);
         }
         try argv_list.append(self.allocator, "--no-sandbox");
+        try argv_list.append(self.allocator, "--remote-allow-origins=*");
+        try argv_list.append(self.allocator, port_flag);
         try argv_list.append(self.allocator, "--remote-allow-origins=*");
         try argv_list.append(self.allocator, port_flag);
 
@@ -184,8 +192,7 @@ pub const Launcher = struct {
             self.allocator.free(flags);
         }
 
-        std.log.info("launched Chrome (pid={d}) on CDP port {d}", .{
-            child.id,
+        std.log.info("launched Chrome on CDP port {d}", .{
             self.cdp_port,
         });
         if (builtin_path != null) {
@@ -249,12 +256,27 @@ pub const Launcher = struct {
     fn findChromeBinary() ?[]const u8 {
         for (chrome_paths) |path| {
             // For absolute paths, check file existence
-            if (path[0] == '/') {
+            // Unix: starts with '/', Windows: starts with drive letter (e.g. C:\)
+            if (path[0] == '/' or (path.len > 2 and path[1] == ':')) {
                 std.fs.cwd().access(path, .{}) catch continue;
                 return path;
             }
-            // For bare names, assume PATH lookup will work
-            return path;
+            // For bare names, verify the binary exists on PATH
+            if (@import("builtin").os.tag == .windows) {
+                // On Windows, bare names are resolved by CreateProcessW via PATH
+                // Just return the first candidate; spawn will fail if not found
+                return path;
+            }
+            const result = std.process.Child.init(
+                &.{ "which", path },
+                std.heap.page_allocator,
+            );
+            var child = result;
+            child.stderr_behavior = .Ignore;
+            child.stdout_behavior = .Ignore;
+            if (child.spawnAndWait()) |term| {
+                if (term.Exited == 0) return path;
+            } else |_| {}
         }
         return null;
     }

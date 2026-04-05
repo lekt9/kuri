@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const net = std.net;
 const bridge_mod = @import("../bridge/bridge.zig");
 const Bridge = bridge_mod.Bridge;
@@ -862,8 +863,7 @@ pub fn discoverTabs(arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_
     defer stream.close();
 
     // Set read timeout (2 seconds) to avoid blocking forever
-    const timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    compat.setRecvTimeout(stream.handle, 2);
 
     // HTTP/1.1 required — Chrome ignores HTTP/1.0
     const http_req = try std.fmt.allocPrint(arena, "GET /json/list HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n", .{ host, port });
@@ -4090,10 +4090,7 @@ fn handleAuthExtract(request: *std.http.Server.Request, arena: std.mem.Allocator
     const profile = getQueryParam(target, "profile") orelse "Default";
 
     // Determine cookie DB path based on browser and platform
-    const home = std.posix.getenv("HOME") orelse {
-        resp.sendError(request, 500, "Cannot determine HOME directory");
-        return;
-    };
+    const home = compat.getHomeDir();
 
     const db_path = switch (@import("builtin").os.tag) {
         .macos => blk: {
@@ -4141,6 +4138,32 @@ fn handleAuthExtract(request: *std.http.Server.Request, arena: std.mem.Allocator
                 };
             } else {
                 resp.sendError(request, 400, "Unsupported browser. Use: chrome, chromium, firefox");
+                return;
+            }
+        },
+        .windows => blk: {
+            if (std.mem.eql(u8, browser, "chrome")) {
+                break :blk std.fmt.allocPrint(arena, "{s}\\AppData\\Local\\Google\\Chrome\\User Data\\{s}\\Network\\Cookies", .{ home, profile }) catch {
+                    resp.sendError(request, 500, "Internal Server Error");
+                    return;
+                };
+            } else if (std.mem.eql(u8, browser, "edge")) {
+                break :blk std.fmt.allocPrint(arena, "{s}\\AppData\\Local\\Microsoft\\Edge\\User Data\\{s}\\Network\\Cookies", .{ home, profile }) catch {
+                    resp.sendError(request, 500, "Internal Server Error");
+                    return;
+                };
+            } else if (std.mem.eql(u8, browser, "brave")) {
+                break :blk std.fmt.allocPrint(arena, "{s}\\AppData\\Local\\BraveSoftware\\Brave-Browser\\User Data\\{s}\\Network\\Cookies", .{ home, profile }) catch {
+                    resp.sendError(request, 500, "Internal Server Error");
+                    return;
+                };
+            } else if (std.mem.eql(u8, browser, "firefox")) {
+                break :blk std.fmt.allocPrint(arena, "{s}\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles", .{home}) catch {
+                    resp.sendError(request, 500, "Internal Server Error");
+                    return;
+                };
+            } else {
+                resp.sendError(request, 400, "Unsupported browser. Use: chrome, edge, brave, firefox");
                 return;
             }
         },
