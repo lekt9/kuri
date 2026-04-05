@@ -10,6 +10,7 @@
 ///   click/type    act on @ref from snap     grab <ref> follows popups
 ///   stealth       anti-bot patches          cookies/headers/audit for security
 const std = @import("std");
+const compat = @import("compat.zig");
 const CdpClient = @import("cdp/client.zig").CdpClient;
 const protocol = @import("cdp/protocol.zig");
 const a11y = @import("snapshot/a11y.zig");
@@ -287,12 +288,12 @@ fn cmdOpen(arena: std.mem.Allocator, port: u16, url: ?[]const u8) !void {
     const port_flag = try std.fmt.allocPrint(arena, "--remote-debugging-port={d}", .{port});
     try argv.append(arena, port_flag);
     // Chrome requires a data dir for CDP; use default profile so cookies/logins persist
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = compat.getHomeDir();
     const data_dir = try std.fmt.allocPrint(arena, "--user-data-dir={s}/.kuri/chrome-profile", .{home});
     try argv.append(arena, data_dir);
 
     // Load extensions from KURI_EXTENSIONS env var
-    if (std.posix.getenv("KURI_EXTENSIONS")) |ext_str| {
+    if (compat.getenv("KURI_EXTENSIONS")) |ext_str| {
         const launcher = @import("chrome/launcher.zig");
         const ext_flags = try launcher.buildExtensionFlags(arena, ext_str);
         for (ext_flags) |f| try argv.append(arena, f);
@@ -685,7 +686,7 @@ fn cmdScreenshot(arena: std.mem.Allocator, client: *CdpClient, out_path: ?[]cons
 
     // Determine output path — default to ~/.kuri/screenshots/<timestamp>.png
     const path: []const u8 = out_path orelse blk: {
-        const home = std.posix.getenv("HOME") orelse ".";
+        const home = compat.getHomeDir();
         const shots_dir = try std.fmt.allocPrint(arena, "{s}/.kuri/screenshots", .{home});
         std.fs.cwd().makePath(shots_dir) catch {};
         const ts = std.time.timestamp();
@@ -1138,7 +1139,7 @@ fn cmdProbe(arena: std.mem.Allocator, client: *CdpClient, tmpl: []const u8, star
 // ── Session I/O ───────────────────────────────────────────────────────────────
 
 fn sessionPath(arena: std.mem.Allocator) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse ".";
+    const home = compat.getHomeDir();
     return std.fmt.allocPrint(arena, "{s}/{s}", .{ home, SESSION_FILE });
 }
 
@@ -1218,7 +1219,7 @@ fn saveSession(arena: std.mem.Allocator, session: *Session) !void {
     const path = try sessionPath(arena);
 
     // Ensure ~/.kuri exists
-    const home = std.posix.getenv("HOME") orelse ".";
+    const home = compat.getHomeDir();
     const dir_path = try std.fmt.allocPrint(arena, "{s}/.kuri", .{home});
     std.fs.cwd().makeDir(dir_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -1258,8 +1259,7 @@ fn fetchChromeTabs(arena: std.mem.Allocator, host: []const u8, port: u16) ![]con
     const stream = try std.net.tcpConnectToAddress(address);
     defer stream.close();
 
-    const timeout = std.posix.timeval{ .sec = 3, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    compat.setRecvTimeout(stream.handle, 3);
 
     const req = try std.fmt.allocPrint(arena, "GET /json/list HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n", .{ host, port });
     try stream.writeAll(req);
@@ -1608,7 +1608,7 @@ fn parseExtensionId(input: []const u8) []const u8 {
 fn extInstall(arena: std.mem.Allocator, input: []const u8) !void {
     const ext_id = parseExtensionId(input);
 
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = compat.getHomeDir();
     const ext_dir = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions/{s}", .{ home, ext_id });
     const crx_path = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions/{s}.crx", .{ home, ext_id });
     const zip_path = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions/{s}.zip", .{ home, ext_id });
@@ -1702,7 +1702,7 @@ fn extInstall(arena: std.mem.Allocator, input: []const u8) !void {
 }
 
 fn extList(arena: std.mem.Allocator) !void {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = compat.getHomeDir();
     const ext_base = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions", .{home});
     const stdout = std.fs.File.stdout();
 
@@ -1739,7 +1739,7 @@ fn extList(arena: std.mem.Allocator) !void {
 }
 
 fn extRemove(arena: std.mem.Allocator, ext_id: []const u8) !void {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = compat.getHomeDir();
     const ext_dir = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions/{s}", .{ home, ext_id });
 
     std.fs.cwd().access(ext_dir, .{}) catch {
@@ -1756,7 +1756,7 @@ fn extRemove(arena: std.mem.Allocator, ext_id: []const u8) !void {
 }
 
 fn extPath(arena: std.mem.Allocator) !void {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = compat.getHomeDir();
     const ext_base = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions", .{home});
 
     var dir = std.fs.cwd().openDir(ext_base, .{ .iterate = true }) catch {

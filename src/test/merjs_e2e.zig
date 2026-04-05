@@ -22,8 +22,13 @@ fn httpGet(allocator: std.mem.Allocator, port: u16, path: []const u8) ![]const u
     const stream = try net.tcpConnectToAddress(addr);
     defer stream.close();
 
-    const timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    if (@import("builtin").os.tag == .windows) {
+        const ms: u32 = 10000;
+        _ = std.os.windows.ws2_32.setsockopt(stream.handle, @intCast(std.os.windows.ws2_32.SOL.SOCKET), @intCast(std.os.windows.ws2_32.SO.RCVTIMEO), @ptrCast(std.mem.asBytes(&ms)), @intCast(@sizeOf(u32)));
+    } else {
+        const timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    }
 
     const req = try std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n", .{ path, port });
     defer allocator.free(req);

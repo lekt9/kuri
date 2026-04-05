@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const protocol = @import("protocol.zig");
 const WebSocketClient = @import("websocket.zig").WebSocketClient;
 
@@ -211,10 +212,8 @@ pub const CdpClient = struct {
         defer self.mu.unlock();
 
         var ws = &(self.ws orelse return);
-        const drain_timeout = std.posix.timeval{ .sec = timeout_sec, .usec = 0 };
-        const orig_timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
-        std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&drain_timeout)) catch {};
-        defer std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&orig_timeout)) catch {};
+        compat.setRecvTimeout(ws.stream.handle, timeout_sec);
+        defer compat.setRecvTimeout(ws.stream.handle, 10);
 
         var drained: u32 = 0;
         while (drained < 2000) : (drained += 1) {

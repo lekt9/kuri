@@ -45,6 +45,7 @@ pub fn main() !void {
 }
 
 test {
+    _ = @import("compat.zig");
     _ = @import("bridge/config.zig");
     _ = @import("bridge/bridge.zig");
     _ = @import("server/router.zig");

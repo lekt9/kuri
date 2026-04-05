@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const net = std.net;
 const Io = std.Io;
 const crypto = std.crypto;
@@ -35,10 +36,7 @@ pub const WebSocketClient = struct {
         errdefer stream.close();
 
         // Set read timeout so we don't block forever
-        const timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
-        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch |err| {
-            std.log.warn("websocket: failed to set read timeout: {s}", .{@errorName(err)});
-        };
+        compat.setRecvTimeout(stream.handle, 10);
 
         var ws = WebSocketClient{
             .allocator = allocator,

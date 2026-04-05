@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const net = std.net;
 
 /// Test harness for agent-led browser automation testing.
@@ -26,8 +27,7 @@ pub const TestHarness = struct {
         defer stream.close();
 
         // Set read timeout
-        const timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
-        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        compat.setRecvTimeout(stream.handle, 10);
 
         const req = try std.fmt.allocPrint(self.allocator, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n", .{ path, self.browdie_port });
         defer self.allocator.free(req);

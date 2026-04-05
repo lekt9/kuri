@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const validator = @import("crawler/validator.zig");
 const markdown = @import("crawler/markdown.zig");
 const js_engine = @import("js_engine.zig");
@@ -199,11 +200,16 @@ fn elapsed(start: i128) u64 {
 
 fn shouldUseColor(force_no_color: bool) bool {
     if (force_no_color) return false;
-    if (std.posix.getenv("NO_COLOR")) |v| {
+    if (compat.getenv("NO_COLOR")) |v| {
         if (v.len > 0) return false;
     }
-    if (std.posix.getenv("TERM")) |term| {
+    if (compat.getenv("TERM")) |term| {
         if (std.mem.eql(u8, term, "dumb")) return false;
+    }
+    if (@import("builtin").os.tag == .windows) {
+        const w = std.os.windows;
+        var mode: w.DWORD = undefined;
+        return w.kernel32.GetConsoleMode(std.fs.File.stderr().handle, &mode) != 0;
     }
     return std.posix.isatty(std.fs.File.stderr().handle);
 }

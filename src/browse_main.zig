@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const markdown = @import("crawler/markdown.zig");
 const validator = @import("crawler/validator.zig");
 
@@ -677,11 +678,17 @@ fn truncateUrl(url: []const u8, max: usize) []const u8 {
 }
 
 fn shouldUseColor() bool {
-    if (std.posix.getenv("NO_COLOR")) |v| {
+    if (compat.getenv("NO_COLOR")) |v| {
         if (v.len > 0) return false;
     }
-    if (std.posix.getenv("TERM")) |term| {
+    if (compat.getenv("TERM")) |term| {
         if (std.mem.eql(u8, term, "dumb")) return false;
+    }
+    if (@import("builtin").os.tag == .windows) {
+        // On Windows, default to color on if stdout is a console
+        const w = std.os.windows;
+        var mode: w.DWORD = undefined;
+        return w.kernel32.GetConsoleMode(std.fs.File.stderr().handle, &mode) != 0;
     }
     return std.posix.isatty(std.fs.File.stderr().handle);
 }
