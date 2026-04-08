@@ -152,10 +152,7 @@ pub const Bridge = struct {
         try self.tabs.put(owned.id, owned);
     }
 
-    pub fn removeTab(self: *Bridge, tab_id: []const u8) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-
+    fn removeTabOwned(self: *Bridge, tab_id: []const u8) void {
         // Grab owned strings before removing from map
         const tab = self.tabs.get(tab_id) orelse {
             if (self.snapshots.getPtr(tab_id)) |cache| cache.deinit();
@@ -204,6 +201,43 @@ pub const Bridge = struct {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value);
         }
+    }
+
+    pub fn removeTab(self: *Bridge, tab_id: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.removeTabOwned(tab_id);
+    }
+
+    fn containsTabId(tab_ids: []const []const u8, tab_id: []const u8) bool {
+        for (tab_ids) |candidate| {
+            if (std.mem.eql(u8, candidate, tab_id)) return true;
+        }
+        return false;
+    }
+
+    pub fn pruneTabsExcept(self: *Bridge, allocator: std.mem.Allocator, live_tab_ids: []const []const u8) !usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        var stale_ids: std.ArrayList([]u8) = .empty;
+        defer {
+            for (stale_ids.items) |tab_id| allocator.free(tab_id);
+            stale_ids.deinit(allocator);
+        }
+
+        var it = self.tabs.keyIterator();
+        while (it.next()) |tab_id| {
+            if (!containsTabId(live_tab_ids, tab_id.*)) {
+                try stale_ids.append(allocator, try allocator.dupe(u8, tab_id.*));
+            }
+        }
+
+        for (stale_ids.items) |tab_id| {
+            self.removeTabOwned(tab_id);
+        }
+
+        return stale_ids.items.len;
     }
 
     pub fn listTabs(self: *Bridge, allocator: std.mem.Allocator) ![]TabEntry {
@@ -465,4 +499,32 @@ test "bridge tab CRUD" {
 
     bridge.removeTab("tab-1");
     try std.testing.expectEqual(@as(usize, 0), bridge.tabCount());
+}
+
+test "bridge pruneTabsExcept removes ghost tabs" {
+    var bridge = Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+
+    try bridge.putTab(.{
+        .id = "stale-tab",
+        .url = "https://stale.example",
+        .title = "Stale",
+        .ws_url = "ws://localhost:9222/devtools/page/stale-tab",
+        .created_at = 1,
+        .last_accessed = 1,
+    });
+    try bridge.putTab(.{
+        .id = "live-tab",
+        .url = "https://live.example",
+        .title = "Live",
+        .ws_url = "ws://localhost:9222/devtools/page/live-tab",
+        .created_at = 2,
+        .last_accessed = 2,
+    });
+
+    const pruned = try bridge.pruneTabsExcept(std.testing.allocator, &.{"live-tab"});
+    try std.testing.expectEqual(@as(usize, 1), pruned);
+    try std.testing.expectEqual(@as(usize, 1), bridge.tabCount());
+    try std.testing.expect(bridge.getTab("stale-tab") == null);
+    try std.testing.expect(bridge.getTab("live-tab") != null);
 }

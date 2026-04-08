@@ -205,7 +205,7 @@ fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *B
     } else if (std.mem.eql(u8, clean_path, "/wait")) {
         handleWait(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/tab/new")) {
-        handleTabNew(request, arena, bridge);
+        handleTabNew(request, arena, bridge, cfg, cdp_port);
     } else if (std.mem.eql(u8, clean_path, "/tab/close")) {
         handleTabClose(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/highlight")) {
@@ -231,7 +231,7 @@ fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *B
     } else if (std.mem.eql(u8, clean_path, "/inspect")) {
         handleInspect(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/window/new")) {
-        handleWindowNew(request, arena, bridge);
+        handleWindowNew(request, arena, bridge, cfg, cdp_port);
     } else if (std.mem.eql(u8, clean_path, "/session/list")) {
         handleSessionList(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/set/viewport")) {
@@ -671,7 +671,7 @@ fn handleAction(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
         .check => "function() { if (!this.checked) { this.click(); } return 'checked'; }",
         .uncheck => "function() { if (this.checked) { this.click(); } return 'unchecked'; }",
         .blur => "function() { this.blur(); return 'blurred'; }",
-        .fill, .@"type" => blk: {
+        .fill, .type => blk: {
             const v = value orelse {
                 resp.sendError(request, 400, "Missing value parameter for fill/type");
                 return;
@@ -692,11 +692,9 @@ fn handleAction(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
                 // Type each character via Input.dispatchKeyEvent
                 for (v) |ch| {
                     const char_str = std.fmt.allocPrint(arena, "{c}", .{ch}) catch continue;
-                    const key_params = std.fmt.allocPrint(arena,
-                        "{{\"type\":\"keyDown\",\"text\":\"{s}\",\"key\":\"{s}\",\"unmodifiedText\":\"{s}\"}}", .{ char_str, char_str, char_str }) catch continue;
+                    const key_params = std.fmt.allocPrint(arena, "{{\"type\":\"keyDown\",\"text\":\"{s}\",\"key\":\"{s}\",\"unmodifiedText\":\"{s}\"}}", .{ char_str, char_str, char_str }) catch continue;
                     _ = client.send(arena, protocol.Methods.input_dispatch_key_event, key_params) catch continue;
-                    const up_params = std.fmt.allocPrint(arena,
-                        "{{\"type\":\"keyUp\",\"key\":\"{s}\"}}", .{char_str}) catch continue;
+                    const up_params = std.fmt.allocPrint(arena, "{{\"type\":\"keyUp\",\"key\":\"{s}\"}}", .{char_str}) catch continue;
                     _ = client.send(arena, protocol.Methods.input_dispatch_key_event, up_params) catch continue;
                 }
                 // Dispatch change event on blur
@@ -758,8 +756,7 @@ fn handleText(request: *std.http.Server.Request, arena: std.mem.Allocator, bridg
 
     const selector = getQueryParam(target, "selector");
     const params = if (selector) |sel|
-        std.fmt.allocPrint(arena,
-            "{{\"expression\":\"document.querySelector('{s}')?.innerText || null\",\"returnByValue\":true}}", .{sel}) catch {
+        std.fmt.allocPrint(arena, "{{\"expression\":\"document.querySelector('{s}')?.innerText || null\",\"returnByValue\":true}}", .{sel}) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         }
@@ -826,8 +823,7 @@ fn handleEvaluate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         return;
     };
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{expr}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{expr}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -894,6 +890,7 @@ pub fn discoverTabs(arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_
 
     // Parse targets and register tabs
     var registered: usize = 0;
+    var live_page_ids: std.ArrayList([]const u8) = .empty;
     var pos: usize = 0;
     while (pos < body.len) {
         const id_start = std.mem.indexOfPos(u8, body, pos, "\"id\"") orelse break;
@@ -908,6 +905,7 @@ pub fn discoverTabs(arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_
         const ws_val = extractSimpleJsonString(body, id_start, "\"webSocketDebuggerUrl\"") orelse "";
 
         if (std.mem.eql(u8, type_val, "page") and ws_val.len > 0) {
+            try live_page_ids.append(arena, id_val);
             const entry = TabEntry{
                 .id = id_val,
                 .url = url_val,
@@ -924,6 +922,8 @@ pub fn discoverTabs(arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_
         pos = next_id;
     }
 
+    _ = try bridge.pruneTabsExcept(arena, live_page_ids.items);
+
     return registered;
 }
 
@@ -939,8 +939,7 @@ fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         return;
     };
 
-    const result = std.fmt.allocPrint(arena,
-        "{{\"discovered\":{d},\"total_tabs\":{d}}}", .{ registered, bridge.tabCount() }) catch {
+    const result = std.fmt.allocPrint(arena, "{{\"discovered\":{d},\"total_tabs\":{d}}}", .{ registered, bridge.tabCount() }) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -1355,8 +1354,7 @@ fn handleCookies(request: *std.http.Server.Request, arena: std.mem.Allocator, br
     if (name != null and value != null) {
         // Set cookie
         const domain = getQueryParam(target, "domain") orelse "localhost";
-        const params = std.fmt.allocPrint(arena,
-            "{{\"name\":\"{s}\",\"value\":\"{s}\",\"domain\":\"{s}\",\"path\":\"/\"}}", .{ name.?, value.?, domain }) catch {
+        const params = std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"value\":\"{s}\",\"domain\":\"{s}\",\"path\":\"/\"}}", .{ name.?, value.?, domain }) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
@@ -1420,8 +1418,7 @@ fn handleStorage(request: *std.http.Server.Request, arena: std.mem.Allocator, br
         return;
     };
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{js}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{js}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -1442,8 +1439,7 @@ fn handleStorageClear(request: *std.http.Server.Request, arena: std.mem.Allocato
         resp.sendError(request, 404, "Tab not found");
         return;
     };
-    const params = std.fmt.allocPrint(arena,
-        "{{\"expression\":\"{s}.clear() || 'cleared'\",\"returnByValue\":true}}", .{storage_type}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}.clear() || 'cleared'\",\"returnByValue\":true}}", .{storage_type}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -1513,8 +1509,7 @@ fn handleGet(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge
         return;
     };
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{js}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{js}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -1696,7 +1691,8 @@ fn handleEmulate(request: *std.http.Server.Request, arena: std.mem.Allocator, br
     const scale_str = getQueryParam(target, "scale") orelse "1";
     const ua = getQueryParam(target, "ua");
 
-    const params = std.fmt.allocPrint(arena,
+    const params = std.fmt.allocPrint(
+        arena,
         "{{\"width\":{s},\"height\":{s},\"deviceScaleFactor\":{s},\"mobile\":false}}",
         .{ width_str, height_str, scale_str },
     ) catch {
@@ -1739,7 +1735,8 @@ fn handleGeolocation(request: *std.http.Server.Request, arena: std.mem.Allocator
     };
     const accuracy_str = getQueryParam(target, "accuracy") orelse "1";
 
-    const params = std.fmt.allocPrint(arena,
+    const params = std.fmt.allocPrint(
+        arena,
         "{{\"latitude\":{s},\"longitude\":{s},\"accuracy\":{s}}}",
         .{ lat, lng, accuracy_str },
     ) catch {
@@ -2420,8 +2417,7 @@ fn handleMarkdown(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         \\})()
     ;
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{js}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{js}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -2447,8 +2443,7 @@ fn handleLinks(request: *std.http.Server.Request, arena: std.mem.Allocator, brid
 
     const js = "JSON.stringify([...document.querySelectorAll('a[href]')].map(a=>({text:a.innerText.trim().substring(0,200),href:a.href})))";
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{js}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{js}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -2473,8 +2468,7 @@ fn handlePdf(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge
     };
 
     const landscape = getQueryParam(target, "landscape") orelse "false";
-    const params = std.fmt.allocPrint(arena,
-        "{{\"landscape\":{s},\"printBackground\":true}}", .{landscape}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"landscape\":{s},\"printBackground\":true}}", .{landscape}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -2517,8 +2511,7 @@ fn handleDomQuery(request: *std.http.Server.Request, arena: std.mem.Allocator, b
     const use_all = if (all) |a| std.mem.eql(u8, a, "true") else false;
     const method = if (use_all) protocol.Methods.dom_query_selector_all else protocol.Methods.dom_query_selector;
 
-    const query_params = std.fmt.allocPrint(arena,
-        "{{\"nodeId\":{d},\"selector\":\"{s}\"}}", .{ root_node_id, selector }) catch {
+    const query_params = std.fmt.allocPrint(arena, "{{\"nodeId\":{d},\"selector\":\"{s}\"}}", .{ root_node_id, selector }) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -2545,8 +2538,7 @@ fn handleDomHtml(request: *std.http.Server.Request, arena: std.mem.Allocator, br
         return;
     };
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"nodeId\":{s}}}", .{node_id_str}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"nodeId\":{s}}}", .{node_id_str}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -2613,8 +2605,7 @@ fn handleHeaders(request: *std.http.Server.Request, arena: std.mem.Allocator, br
         return;
     };
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"headers\":{s}}}", .{body}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"headers\":{s}}}", .{body}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -2663,8 +2654,7 @@ fn handleScriptInject(request: *std.http.Server.Request, arena: std.mem.Allocato
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
-    const params = std.fmt.allocPrint(arena,
-        "{{\"source\":\"{s}\"}}", .{escaped}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"source\":\"{s}\"}}", .{escaped}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -3166,11 +3156,9 @@ fn handleKeyboardType(request: *std.http.Server.Request, arena: std.mem.Allocato
     // Type each character via Input.dispatchKeyEvent
     for (text) |ch| {
         const char_str = std.fmt.allocPrint(arena, "{c}", .{ch}) catch continue;
-        const key_params = std.fmt.allocPrint(arena,
-            "{{\"type\":\"keyDown\",\"text\":\"{s}\",\"key\":\"{s}\",\"unmodifiedText\":\"{s}\"}}", .{ char_str, char_str, char_str }) catch continue;
+        const key_params = std.fmt.allocPrint(arena, "{{\"type\":\"keyDown\",\"text\":\"{s}\",\"key\":\"{s}\",\"unmodifiedText\":\"{s}\"}}", .{ char_str, char_str, char_str }) catch continue;
         _ = client.send(arena, protocol.Methods.input_dispatch_key_event, key_params) catch continue;
-        const up_params = std.fmt.allocPrint(arena,
-            "{{\"type\":\"keyUp\",\"key\":\"{s}\"}}", .{char_str}) catch continue;
+        const up_params = std.fmt.allocPrint(arena, "{{\"type\":\"keyUp\",\"key\":\"{s}\"}}", .{char_str}) catch continue;
         _ = client.send(arena, protocol.Methods.input_dispatch_key_event, up_params) catch continue;
     }
     const body = std.fmt.allocPrint(arena, "{{\"status\":\"ok\",\"typed\":\"{s}\",\"chars\":{d}}}", .{ text, text.len }) catch {
@@ -3325,9 +3313,20 @@ fn handleWait(request: *std.http.Server.Request, arena: std.mem.Allocator, bridg
     }
 }
 
-fn handleTabNew(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {
+fn handleTabNew(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16) void {
     const target = request.head.target;
     const url = getDecodedQueryParamAlloc(arena, target, "url") orelse "about:blank";
+
+    _ = discoverTabs(arena, bridge, cfg, cdp_port) catch |err| {
+        switch (err) {
+            error.CannotResolveChromeAddress => resp.sendError(request, 502, "Cannot resolve Chrome address"),
+            error.CannotConnectToChrome => resp.sendError(request, 502, "Cannot connect to Chrome"),
+            error.EmptyResponseFromChrome => resp.sendError(request, 502, "Empty response from Chrome"),
+            error.InvalidChromeResponse => resp.sendError(request, 502, "Invalid response from Chrome"),
+            else => resp.sendError(request, 500, "Internal Server Error"),
+        }
+        return;
+    };
 
     const params = std.fmt.allocPrint(arena, "{{\"url\":\"{s}\"}}", .{url}) catch {
         resp.sendError(request, 500, "Internal Server Error");
@@ -3355,6 +3354,14 @@ fn handleTabNew(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
 
     // Extract targetId from response
     const new_tab_id = extractSimpleJsonString(response, 0, "\"targetId\"") orelse "unknown";
+    if (!std.mem.eql(u8, new_tab_id, "unknown")) {
+        var attempts: u8 = 0;
+        while (attempts < 10) : (attempts += 1) {
+            _ = discoverTabs(arena, bridge, cfg, cdp_port) catch {};
+            if (bridge.getTab(new_tab_id) != null) break;
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+    }
     const body = std.fmt.allocPrint(arena, "{{\"status\":\"created\",\"tab_id\":\"{s}\",\"url\":\"{s}\"}}", .{ new_tab_id, url }) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
@@ -3399,8 +3406,7 @@ fn handleHighlight(request: *std.http.Server.Request, arena: std.mem.Allocator, 
             resp.sendError(request, 400, "Ref not found");
             return;
         };
-        const params = std.fmt.allocPrint(arena,
-            "{{\"highlightConfig\":{{\"showInfo\":true,\"contentColor\":{{\"r\":111,\"g\":168,\"b\":220,\"a\":0.66}},\"borderColor\":{{\"r\":111,\"g\":168,\"b\":220,\"a\":1}}}},\"backendNodeId\":{d}}}", .{bid}) catch {
+        const params = std.fmt.allocPrint(arena, "{{\"highlightConfig\":{{\"showInfo\":true,\"contentColor\":{{\"r\":111,\"g\":168,\"b\":220,\"a\":0.66}},\"borderColor\":{{\"r\":111,\"g\":168,\"b\":220,\"a\":1}}}},\"backendNodeId\":{d}}}", .{bid}) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
@@ -3411,8 +3417,7 @@ fn handleHighlight(request: *std.http.Server.Request, arena: std.mem.Allocator, 
         resp.sendJson(request, response);
     } else if (selector) |sel| {
         // Highlight via JS + overlay
-        const params = std.fmt.allocPrint(arena,
-            "{{\"expression\":\"(function(){{ var el=document.querySelector('{s}'); if(!el) return 'not_found'; el.style.outline='3px solid #6fa8dc'; return 'highlighted'; }})()\",\"returnByValue\":true}}", .{sel}) catch {
+        const params = std.fmt.allocPrint(arena, "{{\"expression\":\"(function(){{ var el=document.querySelector('{s}'); if(!el) return 'not_found'; el.style.outline='3px solid #6fa8dc'; return 'highlighted'; }})()\",\"returnByValue\":true}}", .{sel}) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
@@ -3465,8 +3470,7 @@ fn handleSetOffline(request: *std.http.Server.Request, arena: std.mem.Allocator,
     };
 
     const offline = std.mem.eql(u8, mode, "on") or std.mem.eql(u8, mode, "true");
-    const params = std.fmt.allocPrint(arena,
-        "{{\"offline\":{s},\"latency\":0,\"downloadThroughput\":-1,\"uploadThroughput\":-1}}", .{if (offline) "true" else "false"}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"offline\":{s},\"latency\":0,\"downloadThroughput\":-1,\"uploadThroughput\":-1}}", .{if (offline) "true" else "false"}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -3494,8 +3498,7 @@ fn handleSetMedia(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         return;
     };
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"features\":[{{\"name\":\"prefers-color-scheme\",\"value\":\"{s}\"}}]}}", .{scheme}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"features\":[{{\"name\":\"prefers-color-scheme\",\"value\":\"{s}\"}}]}}", .{scheme}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -3546,8 +3549,7 @@ fn handleSetCredentials(request: *std.http.Server.Request, arena: std.mem.Alloca
     };
     _ = encoder.encode(encoded, b64_input);
 
-    const header_params = std.fmt.allocPrint(arena,
-        "{{\"headers\":{{\"Authorization\":\"Basic {s}\"}}}}", .{encoded}) catch {
+    const header_params = std.fmt.allocPrint(arena, "{{\"headers\":{{\"Authorization\":\"Basic {s}\"}}}}", .{encoded}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -3584,30 +3586,22 @@ fn handleFind(request: *std.http.Server.Request, arena: std.mem.Allocator, bridg
 
     // Build JS to find elements by semantic locator
     const js = if (std.mem.eql(u8, by, "role"))
-        std.fmt.allocPrint(arena,
-            "JSON.stringify([...document.querySelectorAll('[role=\"{s}\"]')].map((el,i)=>{{return {{index:i,tag:el.tagName,text:el.innerText.substring(0,100),ref:'found_'+i}}}}))", .{value})
+        std.fmt.allocPrint(arena, "JSON.stringify([...document.querySelectorAll('[role=\"{s}\"]')].map((el,i)=>{{return {{index:i,tag:el.tagName,text:el.innerText.substring(0,100),ref:'found_'+i}}}}))", .{value})
     else if (std.mem.eql(u8, by, "text"))
         if (exact != null and std.mem.eql(u8, exact.?, "true"))
-            std.fmt.allocPrint(arena,
-                "JSON.stringify([...document.querySelectorAll('*')].filter(el=>el.innerText.trim()==='{s}'&&el.children.length===0).slice(0,20).map((el,i)=>{{return {{index:i,tag:el.tagName,text:el.innerText.substring(0,100)}}}}))", .{value})
+            std.fmt.allocPrint(arena, "JSON.stringify([...document.querySelectorAll('*')].filter(el=>el.innerText.trim()==='{s}'&&el.children.length===0).slice(0,20).map((el,i)=>{{return {{index:i,tag:el.tagName,text:el.innerText.substring(0,100)}}}}))", .{value})
         else
-            std.fmt.allocPrint(arena,
-                "JSON.stringify([...document.querySelectorAll('*')].filter(el=>el.innerText.includes('{s}')&&el.children.length===0).slice(0,20).map((el,i)=>{{return {{index:i,tag:el.tagName,text:el.innerText.substring(0,100)}}}}))", .{value})
+            std.fmt.allocPrint(arena, "JSON.stringify([...document.querySelectorAll('*')].filter(el=>el.innerText.includes('{s}')&&el.children.length===0).slice(0,20).map((el,i)=>{{return {{index:i,tag:el.tagName,text:el.innerText.substring(0,100)}}}}))", .{value})
     else if (std.mem.eql(u8, by, "label"))
-        std.fmt.allocPrint(arena,
-            "JSON.stringify([...document.querySelectorAll('label')].filter(l=>l.innerText.includes('{s}')).map((l,i)=>{{var el=l.htmlFor?document.getElementById(l.htmlFor):l.querySelector('input,select,textarea');return {{index:i,label:l.innerText.substring(0,100),tag:el?el.tagName:'none'}}}}))", .{value})
+        std.fmt.allocPrint(arena, "JSON.stringify([...document.querySelectorAll('label')].filter(l=>l.innerText.includes('{s}')).map((l,i)=>{{var el=l.htmlFor?document.getElementById(l.htmlFor):l.querySelector('input,select,textarea');return {{index:i,label:l.innerText.substring(0,100),tag:el?el.tagName:'none'}}}}))", .{value})
     else if (std.mem.eql(u8, by, "placeholder"))
-        std.fmt.allocPrint(arena,
-            "JSON.stringify([...document.querySelectorAll('[placeholder]')].filter(el=>el.placeholder.includes('{s}')).map((el,i)=>{{return {{index:i,tag:el.tagName,placeholder:el.placeholder}}}}))", .{value})
+        std.fmt.allocPrint(arena, "JSON.stringify([...document.querySelectorAll('[placeholder]')].filter(el=>el.placeholder.includes('{s}')).map((el,i)=>{{return {{index:i,tag:el.tagName,placeholder:el.placeholder}}}}))", .{value})
     else if (std.mem.eql(u8, by, "testid"))
-        std.fmt.allocPrint(arena,
-            "JSON.stringify([...document.querySelectorAll('[data-testid=\"{s}\"]')].map((el,i)=>{{return {{index:i,tag:el.tagName,text:el.innerText.substring(0,100)}}}}))", .{value})
+        std.fmt.allocPrint(arena, "JSON.stringify([...document.querySelectorAll('[data-testid=\"{s}\"]')].map((el,i)=>{{return {{index:i,tag:el.tagName,text:el.innerText.substring(0,100)}}}}))", .{value})
     else if (std.mem.eql(u8, by, "alt"))
-        std.fmt.allocPrint(arena,
-            "JSON.stringify([...document.querySelectorAll('[alt]')].filter(el=>el.alt.includes('{s}')).map((el,i)=>{{return {{index:i,tag:el.tagName,alt:el.alt}}}}))", .{value})
+        std.fmt.allocPrint(arena, "JSON.stringify([...document.querySelectorAll('[alt]')].filter(el=>el.alt.includes('{s}')).map((el,i)=>{{return {{index:i,tag:el.tagName,alt:el.alt}}}}))", .{value})
     else if (std.mem.eql(u8, by, "title"))
-        std.fmt.allocPrint(arena,
-            "JSON.stringify([...document.querySelectorAll('[title]')].filter(el=>el.title.includes('{s}')).map((el,i)=>{{return {{index:i,tag:el.tagName,title:el.title}}}}))", .{value})
+        std.fmt.allocPrint(arena, "JSON.stringify([...document.querySelectorAll('[title]')].filter(el=>el.title.includes('{s}')).map((el,i)=>{{return {{index:i,tag:el.tagName,title:el.title}}}}))", .{value})
     else {
         resp.sendError(request, 400, "Unknown 'by' type. Use: role|text|label|placeholder|testid|alt|title");
         return;
@@ -3618,8 +3612,7 @@ fn handleFind(request: *std.http.Server.Request, arena: std.mem.Allocator, bridg
         return;
     };
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{expr}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{expr}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -3643,8 +3636,7 @@ fn handleTraceStart(request: *std.http.Server.Request, arena: std.mem.Allocator,
         return;
     };
     const categories = getQueryParam(target, "categories") orelse "-*,devtools.timeline,v8.execute,disabled-by-default-devtools.timeline";
-    const params = std.fmt.allocPrint(arena,
-        "{{\"categories\":\"{s}\",\"options\":\"sampling-frequency=10000\"}}", .{categories}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"categories\":\"{s}\",\"options\":\"sampling-frequency=10000\"}}", .{categories}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -3739,9 +3731,20 @@ fn handleInspect(request: *std.http.Server.Request, arena: std.mem.Allocator, br
     resp.sendJson(request, body);
 }
 
-fn handleWindowNew(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {
+fn handleWindowNew(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16) void {
     const target = request.head.target;
     const url = getDecodedQueryParamAlloc(arena, target, "url") orelse "about:blank";
+
+    _ = discoverTabs(arena, bridge, cfg, cdp_port) catch |err| {
+        switch (err) {
+            error.CannotResolveChromeAddress => resp.sendError(request, 502, "Cannot resolve Chrome address"),
+            error.CannotConnectToChrome => resp.sendError(request, 502, "Cannot connect to Chrome"),
+            error.EmptyResponseFromChrome => resp.sendError(request, 502, "Empty response from Chrome"),
+            error.InvalidChromeResponse => resp.sendError(request, 502, "Invalid response from Chrome"),
+            else => resp.sendError(request, 500, "Internal Server Error"),
+        }
+        return;
+    };
 
     // Get any existing client to create target
     const tabs = bridge.listTabs(arena) catch {
@@ -3775,6 +3778,14 @@ fn handleWindowNew(request: *std.http.Server.Request, arena: std.mem.Allocator, 
         resp.sendError(request, 502, "Target.createTarget failed");
         return;
     };
+    if (extractSimpleJsonString(response, 0, "\"targetId\"")) |new_tab_id| {
+        var attempts: u8 = 0;
+        while (attempts < 10) : (attempts += 1) {
+            _ = discoverTabs(arena, bridge, cfg, cdp_port) catch {};
+            if (bridge.getTab(new_tab_id) != null) break;
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+    }
     resp.sendJson(request, response);
 }
 
@@ -3813,8 +3824,7 @@ fn handleSetViewport(request: *std.http.Server.Request, arena: std.mem.Allocator
         resp.sendError(request, 404, "Tab not found");
         return;
     };
-    const params = std.fmt.allocPrint(arena,
-        "{{\"width\":{s},\"height\":{s},\"deviceScaleFactor\":{s},\"mobile\":false}}", .{ width, height, scale }) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"width\":{s},\"height\":{s},\"deviceScaleFactor\":{s},\"mobile\":false}}", .{ width, height, scale }) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -3823,8 +3833,7 @@ fn handleSetViewport(request: *std.http.Server.Request, arena: std.mem.Allocator
         return;
     };
     _ = response;
-    const body = std.fmt.allocPrint(arena,
-        "{{\"status\":\"ok\",\"width\":{s},\"height\":{s},\"scale\":{s}}}", .{ width, height, scale }) catch {
+    const body = std.fmt.allocPrint(arena, "{{\"status\":\"ok\",\"width\":{s},\"height\":{s},\"scale\":{s}}}", .{ width, height, scale }) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -3893,8 +3902,7 @@ fn handleDomAttributes(request: *std.http.Server.Request, arena: std.mem.Allocat
             resp.sendError(request, 500, "Could not resolve element");
             return;
         };
-        const call_params = std.fmt.allocPrint(arena,
-            "{{\"objectId\":\"{s}\",\"functionDeclaration\":\"function() {{ var attrs={{}}; for(var a of this.attributes){{ attrs[a.name]=a.value; }} return JSON.stringify(attrs); }}\",\"returnByValue\":true}}", .{object_id}) catch {
+        const call_params = std.fmt.allocPrint(arena, "{{\"objectId\":\"{s}\",\"functionDeclaration\":\"function() {{ var attrs={{}}; for(var a of this.attributes){{ attrs[a.name]=a.value; }} return JSON.stringify(attrs); }}\",\"returnByValue\":true}}", .{object_id}) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
@@ -3904,8 +3912,7 @@ fn handleDomAttributes(request: *std.http.Server.Request, arena: std.mem.Allocat
         };
         resp.sendJson(request, response);
     } else if (selector) |sel| {
-        const params = std.fmt.allocPrint(arena,
-            "{{\"expression\":\"(function(){{ var el=document.querySelector('{s}'); if(!el) return 'null'; var attrs={{}}; for(var a of el.attributes){{ attrs[a.name]=a.value; }} return JSON.stringify(attrs); }})()\",\"returnByValue\":true}}", .{sel}) catch {
+        const params = std.fmt.allocPrint(arena, "{{\"expression\":\"(function(){{ var el=document.querySelector('{s}'); if(!el) return 'null'; var attrs={{}}; for(var a of el.attributes){{ attrs[a.name]=a.value; }} return JSON.stringify(attrs); }})()\",\"returnByValue\":true}}", .{sel}) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
@@ -4004,8 +4011,7 @@ fn handlePerfLcp(request: *std.http.Server.Request, arena: std.mem.Allocator, br
         "setTimeout(() => resolve(JSON.stringify({lcp_ms: null, error: 'timeout'})), 10000); " ++
         "}})";
 
-    const params = std.fmt.allocPrint(arena,
-        "{{\"expression\":\"{s}\",\"awaitPromise\":true,\"returnByValue\":true}}", .{lcp_js}) catch {
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"awaitPromise\":true,\"returnByValue\":true}}", .{lcp_js}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -4156,8 +4162,7 @@ fn handleAuthExtract(request: *std.http.Server.Request, arena: std.mem.Allocator
     else
         "";
 
-    const query = std.fmt.allocPrint(arena,
-        "sqlite3 -json '{s}' \"SELECT host_key as domain, name, value, path, is_secure as secure, is_httponly as httpOnly, expires_utc as expires FROM cookies{s} LIMIT 500;\"", .{ db_path, domain_filter }) catch {
+    const query = std.fmt.allocPrint(arena, "sqlite3 -json '{s}' \"SELECT host_key as domain, name, value, path, is_secure as secure, is_httponly as httpOnly, expires_utc as expires FROM cookies{s} LIMIT 500;\"", .{ db_path, domain_filter }) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -4268,7 +4273,6 @@ fn handleWsStop(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
     };
     resp.sendJson(request, response);
 }
-
 
 test "screenshot routes match" {
     for ([_][]const u8{ "/screenshot/annotated", "/screenshot/diff", "/screencast/start", "/screencast/stop" }) |p| {
@@ -4508,42 +4512,27 @@ test "action check/uncheck routes" {
 test "total endpoint count" {
     // Verify we have the expected number of routes
     const routes = [_][]const u8{
-        "/health", "/tabs", "/discover", "/navigate", "/snapshot", "/action",
-        "/text", "/screenshot", "/evaluate", "/browdie",
-        "/har/start", "/har/stop", "/har/status",
-        "/close", "/cookies", "/cookies/clear", "/cookies/delete", "/cookies/set",
-        "/storage/local", "/storage/session", "/storage/local/clear", "/storage/session/clear",
-        "/get", "/back", "/forward", "/reload",
-        "/diff/snapshot", "/emulate", "/geolocation", "/upload",
-        "/session/save", "/session/load",
-        "/auth/profile/save", "/auth/profile/load", "/auth/profile/list", "/auth/profile/delete",
-        "/auth/extract",
-        "/debug/enable", "/debug/disable",
-        "/screenshot/annotated", "/screenshot/diff",
-        "/screencast/start", "/screencast/stop", "/video/start", "/video/stop",
-        "/console", "/intercept/start", "/intercept/stop", "/intercept/requests",
-        "/markdown", "/links", "/pdf",
-        "/dom/query", "/dom/html",
-        "/headers", "/script/inject", "/stop",
+        "/health",              "/tabs",            "/discover",            "/navigate",              "/snapshot",          "/action",
+        "/text",                "/screenshot",      "/evaluate",            "/browdie",               "/har/start",         "/har/stop",
+        "/har/status",          "/close",           "/cookies",             "/cookies/clear",         "/cookies/delete",    "/cookies/set",
+        "/storage/local",       "/storage/session", "/storage/local/clear", "/storage/session/clear", "/get",               "/back",
+        "/forward",             "/reload",          "/diff/snapshot",       "/emulate",               "/geolocation",       "/upload",
+        "/session/save",        "/session/load",    "/auth/profile/save",   "/auth/profile/load",     "/auth/profile/list", "/auth/profile/delete",
+        "/auth/extract",        "/debug/enable",    "/debug/disable",       "/screenshot/annotated",  "/screenshot/diff",   "/screencast/start",
+        "/screencast/stop",     "/video/start",     "/video/stop",          "/console",               "/intercept/start",   "/intercept/stop",
+        "/intercept/requests",  "/markdown",        "/links",               "/pdf",                   "/dom/query",         "/dom/html",
+        "/headers",             "/script/inject",   "/stop",
         // Tier 1 new endpoints
-        "/scrollintoview", "/drag",
-        "/keyboard/type", "/keyboard/inserttext",
-        "/keydown", "/keyup",
-        "/wait",
-        "/tab/new", "/tab/close",
-        "/highlight", "/errors",
-        "/set/offline", "/set/media", "/set/credentials",
+                       "/scrollintoview",        "/drag",              "/keyboard/type",
+        "/keyboard/inserttext", "/keydown",         "/keyup",               "/wait",                  "/tab/new",           "/tab/close",
+        "/highlight",           "/errors",          "/set/offline",         "/set/media",             "/set/credentials",
         // Tier 2 new endpoints
-        "/find",
-        "/trace/start", "/trace/stop",
-        "/profiler/start", "/profiler/stop",
-        "/inspect",
-        "/window/new", "/session/list",
-        "/set/viewport", "/set/useragent",
-        "/dom/attributes", "/frames", "/network",
+          "/find",
+        "/trace/start",         "/trace/stop",      "/profiler/start",      "/profiler/stop",         "/inspect",           "/window/new",
+        "/session/list",        "/set/viewport",    "/set/useragent",       "/dom/attributes",        "/frames",            "/network",
         "/perf/lcp",
         // Tier 3 new endpoints
-        "/ws/start", "/ws/stop",
+                   "/ws/start",        "/ws/stop",
     };
     try std.testing.expectEqual(@as(usize, 87), routes.len);
 }

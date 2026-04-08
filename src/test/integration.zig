@@ -129,6 +129,59 @@ test "discoverTabs hydrates bridge from Chrome target list" {
     try std.testing.expectEqualStrings("ws://127.0.0.1:9222/devtools/page/page-1", tab.ws_url);
 }
 
+test "discoverTabs prunes stale bridge tabs that Chrome no longer reports" {
+    const body =
+        \\[
+        \\  {
+        \\    "id":"live-page",
+        \\    "type":"page",
+        \\    "url":"https://example.com/live",
+        \\    "title":"Live",
+        \\    "webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/live-page"
+        \\  }
+        \\]
+    ;
+
+    var fake = try FakeChromeServer.start(body);
+    defer fake.stop();
+
+    const cdp_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/json/version", .{fake.port});
+    defer std.testing.allocator.free(cdp_url);
+
+    var bridge = Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    try bridge.putTab(.{
+        .id = "ghost-page",
+        .url = "https://stale.example",
+        .title = "Ghost",
+        .ws_url = "ws://127.0.0.1:9222/devtools/page/ghost-page",
+        .created_at = 1,
+        .last_accessed = 1,
+    });
+
+    const cfg = config_mod.Config{
+        .host = "127.0.0.1",
+        .port = 8080,
+        .cdp_url = cdp_url,
+        .auth_secret = null,
+        .state_dir = ".kuri",
+        .stale_tab_interval_s = 30,
+        .request_timeout_ms = 30_000,
+        .navigate_timeout_ms = 30_000,
+        .extensions = null,
+        .headless = true,
+    };
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+
+    const discovered = try router_mod.discoverTabs(arena_impl.allocator(), &bridge, cfg, fake.port);
+    try std.testing.expectEqual(@as(usize, 1), discovered);
+    try std.testing.expectEqual(@as(usize, 1), bridge.tabCount());
+    try std.testing.expect(bridge.getTab("ghost-page") == null);
+    try std.testing.expect(bridge.getTab("live-page") != null);
+}
+
 // ─── Bridge Stress Tests ────────────────────────────────────────────────
 
 test "bridge handles many tabs" {
