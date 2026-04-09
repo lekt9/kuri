@@ -44,7 +44,7 @@ fn handleConnection(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_po
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var read_buf: [8192]u8 = undefined;
+    var read_buf: [65536]u8 = undefined;
     var net_reader = net.Stream.Reader.init(conn.stream, &read_buf);
     var write_buf: [8192]u8 = undefined;
     var net_writer = net.Stream.Writer.init(conn.stream, &write_buf);
@@ -814,11 +814,27 @@ fn handleEvaluate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         resp.sendError(request, 400, "Missing tab_id parameter");
         return;
     };
-    const expr_decoded = getDecodedQueryParamAlloc(arena, target, "expression") orelse {
-        resp.sendError(request, 400, "Missing expression parameter");
-        return;
+
+    // Support both POST body and query param for expression.
+    // POST body is preferred for large scripts that exceed URL length limits.
+    const expr_raw = blk: {
+        if (readRequestBody(request, arena)) |body| {
+            if (body.len > 0) {
+                // Try JSON body: {"expression": "..."}
+                if (extractSimpleJsonString(body, 0, "\"expression\"")) |s| {
+                    break :blk s;
+                }
+                // Treat entire body as raw expression
+                break :blk body;
+            }
+        }
+        // Fall back to URL-decoded query param
+        break :blk getDecodedQueryParamAlloc(arena, target, "expression") orelse {
+            resp.sendError(request, 400, "Missing expression parameter — send as POST body or ?expression= query param");
+            return;
+        };
     };
-    const expr = jsonEscapeAlloc(arena, expr_decoded) orelse {
+    const expr = jsonEscapeAlloc(arena, expr_raw) orelse {
         resp.sendError(request, 500, "Failed to encode expression");
         return;
     };
