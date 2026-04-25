@@ -28,8 +28,17 @@ pub const EventBuffer = struct {
             oldest.owner.free(oldest.data);
             _ = self.items.orderedRemove(0);
         }
-        self.items.append(self.allocator, .{ .data = event, .owner = owner }) catch {
+        // Dupe into our own (long-lived) allocator so events outlive the
+        // caller's per-request arena. Without this dupe, calling
+        // `item.owner.free(item.data)` later — when `owner` is a dead arena —
+        // is use-after-free and segfaults during HAR flush.
+        const owned = self.allocator.dupe(u8, event) catch {
             owner.free(event);
+            return;
+        };
+        owner.free(event);
+        self.items.append(self.allocator, .{ .data = owned, .owner = self.allocator }) catch {
+            self.allocator.free(owned);
         };
     }
 
