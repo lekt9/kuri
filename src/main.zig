@@ -13,14 +13,12 @@ const CliAction = enum {
     version,
 };
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
-    const gpa = gpa_impl.allocator();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
 
     var arena_impl = std.heap.ArenaAllocator.init(gpa);
     defer arena_impl.deinit();
-    const args = try init.args.toSlice(arena_impl.allocator());
+    const args = try init.minimal.args.toSlice(arena_impl.allocator());
 
     const action = parseCliAction(args) catch {
         printUnknownArgument(args[1]);
@@ -45,7 +43,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.log.info("listening on {s}:{d}", .{ cfg.host, cfg.port });
 
     // Chrome lifecycle management
-    var chrome = launcher.Launcher.init(gpa, cfg);
+    var chrome = launcher.Launcher.init(gpa, init.io, cfg);
     defer chrome.deinit();
 
     if (cfg.cdp_url) |url| {

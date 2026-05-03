@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "ext")) {
-        try cmdExt(arena, rest);
+        try cmdExt(arena, init.io, rest);
         return;
     }
 
@@ -290,7 +290,7 @@ fn cmdOpen(arena: std.mem.Allocator, port: u16, url: ?[]const u8) !void {
     try argv.append(arena, data_dir);
 
     // Load extensions from KURI_EXTENSIONS env var
-    if (std.posix.getenv("KURI_EXTENSIONS")) |ext_str| {
+    if (compat.getenv("KURI_EXTENSIONS")) |ext_str| {
         const launcher = @import("chrome/launcher.zig");
         const ext_flags = try launcher.buildExtensionFlags(arena, ext_str);
         for (ext_flags) |f| try argv.append(arena, f);
@@ -1675,7 +1675,7 @@ fn printUsage() void {
 
 // ── Extension management ────────────────────────────────────────────────
 
-fn cmdExt(arena: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdExt(arena: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     if (args.len < 1) {
         fatal("ext: requires subcommand (install, list, remove)\n", .{});
     }
@@ -1684,14 +1684,14 @@ fn cmdExt(arena: std.mem.Allocator, args: []const []const u8) !void {
 
     if (std.mem.eql(u8, sub, "install")) {
         if (rest.len < 1) fatal("ext install: requires <extension-id or chrome-web-store-url>\n", .{});
-        try extInstall(arena, rest[0]);
+        try extInstall(arena, io, rest[0]);
     } else if (std.mem.eql(u8, sub, "list") or std.mem.eql(u8, sub, "ls")) {
-        try extList(arena);
+        try extList(arena, io);
     } else if (std.mem.eql(u8, sub, "remove") or std.mem.eql(u8, sub, "rm")) {
         if (rest.len < 1) fatal("ext remove: requires <extension-id>\n", .{});
-        try extRemove(arena, rest[0]);
+        try extRemove(arena, io, rest[0]);
     } else if (std.mem.eql(u8, sub, "path")) {
-        try extPath(arena);
+        try extPath(arena, io);
     } else {
         fatal("ext: unknown subcommand '{s}'. Use: install, list, remove, path\n", .{sub});
     }
@@ -1710,24 +1710,24 @@ fn parseExtensionId(input: []const u8) []const u8 {
     return input;
 }
 
-fn extInstall(arena: std.mem.Allocator, input: []const u8) !void {
+fn extInstall(arena: std.mem.Allocator, io: std.Io, input: []const u8) !void {
     const ext_id = parseExtensionId(input);
 
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = compat.getenv("HOME") orelse "/tmp";
     const ext_dir = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions/{s}", .{ home, ext_id });
     const crx_path = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions/{s}.crx", .{ home, ext_id });
     const zip_path = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions/{s}.zip", .{ home, ext_id });
 
     // Check if already installed
-    if (std.fs.cwd().access(ext_dir, .{})) |_| {
+    if (std.Io.Dir.cwd().access(io, ext_dir, .{})) |_| {
         const out = try std.fmt.allocPrint(arena, "{{\"ok\":true,\"status\":\"already_installed\",\"id\":\"{s}\",\"path\":\"{s}\"}}\n", .{ ext_id, ext_dir });
-        std.fs.File.stdout().writeAll(out) catch {};
+        compat.writeToStdout(out);
         return;
     } else |_| {}
 
     // Ensure parent dir
     const parent = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions", .{home});
-    std.fs.cwd().makePath(parent) catch {};
+    std.Io.Dir.cwd().createDirPath(io, parent) catch {};
 
     // Download CRX from Chrome Web Store
     const download_url = try std.fmt.allocPrint(
@@ -1738,20 +1738,20 @@ fn extInstall(arena: std.mem.Allocator, input: []const u8) !void {
 
     std.debug.print("downloading {s}...\n", .{ext_id});
 
-    const curl_result = try std.process.Child.run(.{
-        .allocator = arena,
+    const curl_result = try std.process.run(arena, io, .{
         .argv = &.{ "curl", "-sL", "-o", crx_path, download_url },
     });
 
-    if (curl_result.term.Exited != 0) {
-        fatal("download failed (curl exit {d})\n", .{curl_result.term.Exited});
+    const curl_exit = switch (curl_result.term) {
+        .exited => |code| code,
+        else => 1,
+    };
+    if (curl_exit != 0) {
+        fatal("download failed (curl exit {d})\n", .{curl_exit});
     }
 
     // Read CRX and strip header to get ZIP
-    const crx_file = try std.fs.cwd().openFile(crx_path, .{});
-    defer crx_file.close();
-
-    const crx_data = try crx_file.readToEndAlloc(arena, 200 * 1024 * 1024);
+    const crx_data = try compat.cwdReadFile(arena, crx_path, 200 * 1024 * 1024);
 
     if (crx_data.len < 16) {
         fatal("downloaded file too small ({d} bytes) — invalid extension ID?\n", .{crx_data.len});
@@ -1776,65 +1776,62 @@ fn extInstall(arena: std.mem.Allocator, input: []const u8) !void {
     }
 
     // Write ZIP
-    const zip_file = try std.fs.cwd().createFile(zip_path, .{});
-    defer zip_file.close();
-    try zip_file.writeAll(zip_data);
+    try compat.cwdWriteFile(zip_path, zip_data);
 
     // Extract
-    std.fs.cwd().makePath(ext_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, ext_dir) catch {};
 
-    const unzip_result = try std.process.Child.run(.{
-        .allocator = arena,
+    const unzip_result = try std.process.run(arena, io, .{
         .argv = &.{ "unzip", "-qo", zip_path, "-d", ext_dir },
     });
 
-    if (unzip_result.term.Exited != 0) {
-        fatal("unzip failed (exit {d})\n", .{unzip_result.term.Exited});
+    const unzip_exit = switch (unzip_result.term) {
+        .exited => |code| code,
+        else => 1,
+    };
+    if (unzip_exit != 0) {
+        fatal("unzip failed (exit {d})\n", .{unzip_exit});
     }
 
     // Clean up temp files and _metadata (Chrome rejects CRX signatures on unpacked extensions)
-    std.fs.cwd().deleteFile(crx_path) catch {};
-    std.fs.cwd().deleteFile(zip_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, crx_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, zip_path) catch {};
     const metadata_dir = try std.fmt.allocPrint(arena, "{s}/_metadata", .{ext_dir});
-    std.fs.cwd().deleteTree(metadata_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(io, metadata_dir) catch {};
 
     std.debug.print("installed to {s}\n", .{ext_dir});
 
     const out = try std.fmt.allocPrint(arena, "{{\"ok\":true,\"id\":\"{s}\",\"path\":\"{s}\"}}\n", .{ ext_id, ext_dir });
-    std.fs.File.stdout().writeAll(out) catch {};
+    compat.writeToStdout(out);
     const usage = try std.fmt.allocPrint(arena, "\nTo use:\n  KURI_EXTENSIONS={s} kuri\n", .{ext_dir});
-    std.fs.File.stdout().writeAll(usage) catch {};
+    compat.writeToStdout(usage);
 }
 
-fn extList(arena: std.mem.Allocator) !void {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+fn extList(arena: std.mem.Allocator, io: std.Io) !void {
+    const home = compat.getenv("HOME") orelse "/tmp";
     const ext_base = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions", .{home});
-    const stdout = std.fs.File.stdout();
-
-    var dir = std.fs.cwd().openDir(ext_base, .{ .iterate = true }) catch {
-        stdout.writeAll("{\"extensions\":[]}\n") catch {};
+    var dir = std.Io.Dir.cwd().openDir(io, ext_base, .{ .iterate = true }) catch {
+        compat.writeToStdout("{\"extensions\":[]}\n");
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var extensions: std.ArrayList([]const u8) = .empty;
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind == .directory) {
             try extensions.append(arena, try arena.dupe(u8, entry.name));
         }
     }
 
-    var buf: std.ArrayList(u8) = .empty;
-    const w = buf.writer(arena);
-    w.writeAll("{\"extensions\":[") catch {};
+    compat.writeToStdout("{\"extensions\":[");
     for (extensions.items, 0..) |name, i| {
-        if (i > 0) w.writeAll(",") catch {};
+        if (i > 0) compat.writeToStdout(",");
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ ext_base, name });
-        w.print("{{\"id\":\"{s}\",\"path\":\"{s}\"}}", .{ name, path }) catch {};
+        const item = try std.fmt.allocPrint(arena, "{{\"id\":\"{s}\",\"path\":\"{s}\"}}", .{ name, path });
+        compat.writeToStdout(item);
     }
-    w.writeAll("]}\n") catch {};
-    stdout.writeAll(buf.items) catch {};
+    compat.writeToStdout("]}\n");
 
     if (extensions.items.len == 0) {
         std.debug.print("no extensions installed. Use: kuri-agent ext install <id>\n", .{});
@@ -1843,37 +1840,37 @@ fn extList(arena: std.mem.Allocator) !void {
     }
 }
 
-fn extRemove(arena: std.mem.Allocator, ext_id: []const u8) !void {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+fn extRemove(arena: std.mem.Allocator, io: std.Io, ext_id: []const u8) !void {
+    const home = compat.getenv("HOME") orelse "/tmp";
     const ext_dir = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions/{s}", .{ home, ext_id });
 
-    std.fs.cwd().access(ext_dir, .{}) catch {
+    std.Io.Dir.cwd().access(io, ext_dir, .{}) catch {
         fatal("extension '{s}' not found at {s}\n", .{ ext_id, ext_dir });
     };
 
-    std.fs.cwd().deleteTree(ext_dir) catch |err| {
+    std.Io.Dir.cwd().deleteTree(io, ext_dir) catch |err| {
         fatal("failed to remove {s}: {s}\n", .{ ext_dir, @errorName(err) });
     };
 
     const out = try std.fmt.allocPrint(arena, "{{\"ok\":true,\"removed\":\"{s}\"}}\n", .{ext_id});
-    std.fs.File.stdout().writeAll(out) catch {};
+    compat.writeToStdout(out);
     std.debug.print("removed {s}\n", .{ext_dir});
 }
 
-fn extPath(arena: std.mem.Allocator) !void {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+fn extPath(arena: std.mem.Allocator, io: std.Io) !void {
+    const home = compat.getenv("HOME") orelse "/tmp";
     const ext_base = try std.fmt.allocPrint(arena, "{s}/.kuri/extensions", .{home});
 
-    var dir = std.fs.cwd().openDir(ext_base, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.cwd().openDir(io, ext_base, .{ .iterate = true }) catch {
         std.debug.print("no extensions installed\n", .{});
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var paths: std.ArrayList(u8) = .empty;
     var iter = dir.iterate();
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind == .directory) {
             if (count > 0) try paths.append(arena, ',');
             const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ ext_base, entry.name });
@@ -1888,5 +1885,5 @@ fn extPath(arena: std.mem.Allocator) !void {
     }
 
     const out = try std.fmt.allocPrint(arena, "{s}\n", .{paths.items});
-    std.fs.File.stdout().writeAll(out) catch {};
+    compat.writeToStdout(out);
 }

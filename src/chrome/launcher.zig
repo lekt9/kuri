@@ -8,6 +8,7 @@ const compat = @import("../compat.zig");
 /// health-checking via /json/version, and auto-restart on crash.
 pub const Launcher = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     cdp_port: u16,
     child_pid: ?std.c.pid_t,
     ws_url_buf: [512]u8,
@@ -59,10 +60,11 @@ pub const Launcher = struct {
     };
 
     /// Initialize a launcher. If `cdp_url` is set in config, uses external mode.
-    pub fn init(allocator: std.mem.Allocator, cfg: config.Config) Launcher {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) Launcher {
         const mode: Mode = if (cfg.cdp_url != null) .external else .managed;
         return .{
             .allocator = allocator,
+            .io = io,
             .cdp_port = default_cdp_port,
             .child_pid = null,
             .ws_url_buf = undefined,
@@ -110,7 +112,7 @@ pub const Launcher = struct {
         };
 
         // Extract builtin extension to disk and prepend to extensions list
-        const builtin_path = extensions_mod.extractBuiltinExtension(self.allocator, self.state_dir) catch |err| blk: {
+        const builtin_path = extensions_mod.extractBuiltinExtension(self.allocator, self.io, self.state_dir) catch |err| blk: {
             std.log.warn("failed to extract builtin extension: {}, continuing without it", .{err});
             break :blk null;
         };
