@@ -34,6 +34,17 @@ const fingerprint_mod = @import("fingerprint.zig");
 const Sandbox = runtime.Sandbox;
 const Fingerprint = fingerprint_mod.Fingerprint;
 
+pub const SeedCookie = struct {
+    name: []const u8,
+    value: []const u8,
+    domain: []const u8 = "",
+    path: []const u8 = "/",
+    secure: bool = false,
+    http_only: bool = false,
+    same_site: []const u8 = "",
+    expires: i64 = 0,
+};
+
 pub const Request = struct {
     target_origin: []const u8,
     target_href: ?[]const u8 = null,
@@ -43,6 +54,7 @@ pub const Request = struct {
     impersonate_profile: []const u8 = "chrome131",
     post_eval: ?[]const u8 = null,
     timeout_ms: u32 = 5_000,
+    seed_cookies: []SeedCookie = &.{},
 
     pub fn parse(allocator: std.mem.Allocator, body: []const u8) !Request {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -59,9 +71,62 @@ pub const Request = struct {
             .impersonate_profile = try dupeOrDefault(allocator, obj.get("impersonate"), "chrome131"),
             .post_eval = try dupeOpt(allocator, obj.get("post_eval")),
             .timeout_ms = @intCast(if (obj.get("timeout_ms")) |v| (if (v == .integer) v.integer else 5_000) else 5_000),
+            .seed_cookies = try parseSeedCookies(allocator, obj.get("seed_cookies")),
         };
     }
 };
+
+fn parseSeedCookies(allocator: std.mem.Allocator, v: ?std.json.Value) ![]SeedCookie {
+    if (v == null or v.? != .array) return &.{};
+    const arr = v.?.array;
+    var out = try allocator.alloc(SeedCookie, arr.items.len);
+    var n: usize = 0;
+    for (arr.items) |item| {
+        if (item != .object) continue;
+        const o = item.object;
+        const name_v = o.get("name");
+        const val_v = o.get("value");
+        if (name_v == null or val_v == null or name_v.? != .string or val_v.? != .string) continue;
+        out[n] = .{
+            .name = try allocator.dupe(u8, name_v.?.string),
+            .value = try allocator.dupe(u8, val_v.?.string),
+            .domain = try jsonStrOr(allocator, o.get("domain"), ""),
+            .path = try jsonStrOr(allocator, o.get("path"), "/"),
+            .secure = jsonBoolOr(o.get("secure"), false),
+            .http_only = jsonBoolOr(o.get("httpOnly") orelse o.get("http_only"), false),
+            .same_site = try jsonStrOr(allocator, o.get("sameSite") orelse o.get("same_site"), ""),
+            .expires = jsonIntOr(o.get("expires"), 0),
+        };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn jsonStrOr(allocator: std.mem.Allocator, v: ?std.json.Value, default: []const u8) ![]const u8 {
+    if (v) |val| if (val == .string) return try allocator.dupe(u8, val.string);
+    return try allocator.dupe(u8, default);
+}
+fn jsonBoolOr(v: ?std.json.Value, default: bool) bool {
+    if (v) |val| if (val == .bool) return val.bool;
+    return default;
+}
+fn jsonIntOr(v: ?std.json.Value, default: i64) i64 {
+    if (v) |val| {
+        if (val == .integer) return val.integer;
+        if (val == .float) return @intFromFloat(val.float);
+    }
+    return default;
+}
+
+fn hostFromOrigin(origin: []const u8) []const u8 {
+    var rest = origin;
+    if (std.mem.startsWith(u8, rest, "https://")) rest = rest[8..]
+    else if (std.mem.startsWith(u8, rest, "http://")) rest = rest[7..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    var host = rest[0..slash];
+    if (std.mem.indexOfScalar(u8, host, ':')) |c| host = host[0..c];
+    return host;
+}
 
 fn dupeOpt(allocator: std.mem.Allocator, v: ?std.json.Value) !?[]const u8 {
     if (v == null) return null;
@@ -110,6 +175,25 @@ pub fn run(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     defer sb.deinit();
 
     try sb.installShim();
+
+    // Seed cookie jar with caller-provided cookies (typically extracted from
+    // the user's real Chrome via findBestBrowserSession). Done BEFORE bundle
+    // eval so document.cookie reads them and so the bundle's own fetch calls
+    // include them via the Cookie header.
+    for (req.seed_cookies) |c| {
+        // Re-encode as a Set-Cookie value and feed through applySetCookie so
+        // the same parsing/scoping rules apply as inbound responses.
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(allocator);
+        try line.print(allocator, "{s}={s}", .{ c.name, c.value });
+        if (c.domain.len > 0) try line.print(allocator, "; Domain={s}", .{c.domain});
+        if (c.path.len > 0) try line.print(allocator, "; Path={s}", .{c.path});
+        if (c.secure) try line.appendSlice(allocator, "; Secure");
+        if (c.http_only) try line.appendSlice(allocator, "; HttpOnly");
+        if (c.same_site.len > 0) try line.print(allocator, "; SameSite={s}", .{c.same_site});
+        const default_host = if (c.domain.len > 0) c.domain else hostFromOrigin(req.target_origin);
+        sb.cookie_jar.applySetCookie(default_host, line.items) catch {};
+    }
 
     // Source: either inline bundle_source, or fetch bundle_url through the
     // sandbox's own network so it goes through curl-impersonate.

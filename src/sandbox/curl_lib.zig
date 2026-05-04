@@ -207,6 +207,10 @@ pub fn perform(allocator: std.mem.Allocator, req: Request) Error!Response {
     try setoptCheckLong(easy, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_longlong, @intCast(req.connect_timeout_ms)));
     try setoptCheckLong(easy, c.CURLOPT_TIMEOUT_MS, @as(c_longlong, @intCast(req.total_timeout_ms)));
     try setoptCheckLong(easy, c.CURLOPT_NOSIGNAL, 1);
+    // Empty string = "advertise all supported encodings AND auto-decode response".
+    // Without this we'd get gzip-compressed bodies (since impersonate() set
+    // Accept-Encoding to Chrome's default "gzip, deflate, br, zstd").
+    try setoptCheck(easy, c.CURLOPT_ACCEPT_ENCODING, @as([*:0]const u8, ""));
 
     // 8. Capture callbacks.
     try setoptCheck(easy, c.CURLOPT_WRITEFUNCTION, &writeCb);
