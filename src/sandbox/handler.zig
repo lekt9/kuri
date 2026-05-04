@@ -253,6 +253,7 @@ pub fn run(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
         .cookies = cookies,
         .post_eval = post_eval_result,
         .egress_bytes = sb.egress_bytes,
+        .routes_observed = sb.routes_observed.items,
     });
 }
 
@@ -271,7 +272,9 @@ const ResponseSummary = struct {
     cookies: []const network.Cookie,
     post_eval: ?[]const u8,
     egress_bytes: usize,
+    routes_observed: []const runtime.RouteRecord,
 };
+
 
 fn buildResponseJson(allocator: std.mem.Allocator, r: ResponseSummary) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
@@ -314,6 +317,32 @@ fn buildResponseJson(allocator: std.mem.Allocator, r: ResponseSummary) ![]u8 {
             try buf.appendSlice(allocator, pe);
         }
     }
+
+    // routes_observed — every __nativeFetch call from the bundle, fed by
+    // Node-side into extractEndpoints + marketplace publish.
+    try buf.appendSlice(allocator, ",\"routes_observed\":[");
+    for (r.routes_observed, 0..) |route, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.append(allocator, '{');
+        try writeJsonStr(allocator, &buf, "url", route.url);
+        try buf.append(allocator, ',');
+        try writeJsonStr(allocator, &buf, "method", route.method);
+        try buf.appendSlice(allocator, ",\"status\":");
+        try buf.print(allocator, "{d}", .{route.status});
+        try buf.append(allocator, ',');
+        try writeJsonStr(allocator, &buf, "final_url", route.final_url);
+        try buf.append(allocator, ',');
+        try writeJsonStr(allocator, &buf, "content_type", route.content_type);
+        try buf.append(allocator, ',');
+        try writeJsonStr(allocator, &buf, "body_excerpt", route.body_excerpt);
+        try buf.appendSlice(allocator, ",\"body_size\":");
+        try buf.print(allocator, "{d}", .{route.body_size});
+        try buf.appendSlice(allocator, ",\"redirected\":");
+        try buf.appendSlice(allocator, if (route.redirected) "true" else "false");
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+
     try buf.append(allocator, '}');
     return buf.toOwnedSlice(allocator);
 }

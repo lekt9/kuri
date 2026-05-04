@@ -37,6 +37,19 @@ pub const SandboxOptions = struct {
     impersonate_profile: []const u8 = "chrome131",
 };
 
+/// One observed network call from a sandbox bundle. Surfaced in the response
+/// so Node-side can feed through extractEndpoints + publish to marketplace.
+pub const RouteRecord = struct {
+    url: []u8,
+    method: []u8,
+    status: u16,
+    final_url: []u8,
+    content_type: []u8,
+    body_excerpt: []u8, // first 4KB of body for extractEndpoints
+    body_size: usize,
+    redirected: bool,
+};
+
 pub const SandboxError = error{
     RuntimeInitFailed,
     ContextInitFailed,
@@ -59,6 +72,11 @@ pub const Sandbox = struct {
     cookie_jar: *network.CookieJar,
     egress_bytes: usize = 0,
     start_ms: i64 = 0,
+    /// Every __nativeFetch call appends here so the handler can return a
+    /// `routes_observed` list. Caller (Node side) feeds these through
+    /// extractEndpoints + publishes to the marketplace — turns every
+    /// authenticated agent fetch into flywheel input.
+    routes_observed: std.ArrayList(RouteRecord),
 
     pub fn init(allocator: std.mem.Allocator, options: SandboxOptions) SandboxError!*Sandbox {
         const rt = quickjs.Runtime.init() catch return SandboxError.RuntimeInitFailed;
@@ -87,6 +105,7 @@ pub const Sandbox = struct {
             .network = net,
             .cookie_jar = jar,
             .start_ms = compat.milliTimestamp(),
+            .routes_observed = .empty,
         };
 
         // Attach self to the context so native callbacks can find it.
@@ -99,6 +118,14 @@ pub const Sandbox = struct {
         self.rt.deinit();
         self.cookie_jar.deinit();
         self.network.deinit();
+        for (self.routes_observed.items) |r| {
+            self.allocator.free(r.url);
+            self.allocator.free(r.method);
+            self.allocator.free(r.final_url);
+            self.allocator.free(r.content_type);
+            self.allocator.free(r.body_excerpt);
+        }
+        self.routes_observed.deinit(self.allocator);
         self.allocator.destroy(self.cookie_jar);
         self.allocator.destroy(self.network);
         const a = self.allocator;
@@ -239,6 +266,36 @@ fn throwTypeError(ctx: *quickjs.Context, comptime msg: []const u8) quickjs.Value
     return err.throw(ctx);
 }
 
+
+fn appendRouteRecord(sb: *Sandbox, method: []const u8, url: []const u8, response: *network.Response) !void {
+    const a = sb.allocator;
+
+    // Find the content-type header (case-insensitive).
+    var content_type: []const u8 = "";
+    for (response.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
+            content_type = h.value;
+            break;
+        }
+    }
+
+    // Sample first 4KB of body — enough for extractEndpoints to detect
+    // JSON shapes / API patterns without bloating the response.
+    const body_bytes = response.body;
+    const sample_len = @min(body_bytes.len, 4096);
+
+    const record: RouteRecord = .{
+        .url = try a.dupe(u8, url),
+        .method = try a.dupe(u8, method),
+        .status = response.status,
+        .final_url = try a.dupe(u8, response.final_url),
+        .content_type = try a.dupe(u8, content_type),
+        .body_excerpt = try a.dupe(u8, body_bytes[0..sample_len]),
+        .body_size = body_bytes.len,
+        .redirected = response.redirected,
+    };
+    try sb.routes_observed.append(a, record);
+}
 /// __nativeFetch(method: string, url: string, headers: object, body: string|null)
 ///   -> { status, statusText, url, headers, body }
 fn jsNativeFetch(ctx_opt: ?*quickjs.Context, _: quickjs.Value, args: []const quickjs.c.JSValue) quickjs.Value {
@@ -316,6 +373,10 @@ fn jsNativeFetch(ctx_opt: ?*quickjs.Context, _: quickjs.Value, args: []const qui
         return throwTypeError(ctx, "network error");
     };
     defer response.deinit();
+
+    // Append RouteRecord for the marketplace flywheel. Best-effort: alloc
+    // failures here just skip the record (the user-visible call still succeeds).
+    appendRouteRecord(sb, method, url, &response) catch {};
 
     // Build the JS response object.
     const obj = quickjs.Value.initObject(ctx);
