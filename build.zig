@@ -74,6 +74,46 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addImport("quickjs", quickjs_dep.module("quickjs"));
     unit_tests.root_module.linkLibrary(quickjs_dep.artifact("quickjs-ng"));
 
+    // ── curl-impersonate (statically linked into kuri binary) ────────────────
+    // Vendored archives at vendor/curl-impersonate/<arch>-<os>/libcurl-impersonate.a
+    // contain libcurl + BoringSSL + nghttp2 + brotli + zstd + libpsl, all
+    // baked into one static library. Single FFI call site
+    // (src/sandbox/curl_lib.zig) wraps it for the bundle replay sandbox.
+    const ci_arch_os = pickCurlImpersonateTriple(target.result) catch null;
+    if (ci_arch_os) |triple| {
+        const ci_lib_path = b.path(b.fmt("vendor/curl-impersonate/{s}/libcurl-impersonate.a", .{triple}));
+        const ci_include = b.path("vendor/curl-impersonate/include");
+        for ([_]*std.Build.Step.Compile{ exe, unit_tests }) |compile_step| {
+            compile_step.root_module.addObjectFile(ci_lib_path);
+            compile_step.root_module.addIncludePath(ci_include);
+            // libcurl-impersonate's BoringSSL needs system frameworks for DNS,
+            // keychain access (cert validation fallback path), and SystemConfig.
+            if (target.result.os.tag == .macos) {
+                // BoringSSL is C++; need libc++ runtime.
+                compile_step.root_module.link_libcpp = true;
+                // Frameworks: cert validation, DNS resolution, keychain.
+                compile_step.root_module.linkFramework("CoreFoundation", .{});
+                compile_step.root_module.linkFramework("Security", .{});
+                compile_step.root_module.linkFramework("SystemConfiguration", .{});
+                // System libs: iconv (libidn punycode), ICU (uidna_*).
+                compile_step.root_module.linkSystemLibrary("iconv", .{});
+                compile_step.root_module.linkSystemLibrary("icucore", .{});
+            }
+            if (target.result.os.tag == .linux) {
+                compile_step.root_module.link_libcpp = true;
+                compile_step.root_module.linkSystemLibrary("z", .{});
+                compile_step.root_module.linkSystemLibrary("pthread", .{});
+                compile_step.root_module.linkSystemLibrary("dl", .{});
+                compile_step.root_module.linkSystemLibrary("idn2", .{});
+            }
+        }
+    } else {
+        std.log.warn(
+            "kuri build: no vendored libcurl-impersonate for {s}-{s}; sandbox will fall back to subprocess curl",
+            .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) },
+        );
+    }
+
     // Sandbox-only test step (sidesteps pre-existing chrome/launcher test bitrot).
     const sandbox_test_mod = b.createModule(.{
         .root_source_file = b.path("src/sandbox_smoke.zig"),
@@ -84,6 +124,29 @@ pub fn build(b: *std.Build) void {
     sandbox_test_mod.addImport("quickjs", quickjs_dep.module("quickjs"));
     const sandbox_tests = b.addTest(.{ .root_module = sandbox_test_mod });
     sandbox_tests.root_module.linkLibrary(quickjs_dep.artifact("quickjs-ng"));
+    // Same curl-impersonate wiring as exe + unit_tests so curl_lib symbols resolve.
+    if (pickCurlImpersonateTriple(target.result) catch null) |triple| {
+        sandbox_tests.root_module.addObjectFile(
+            b.path(b.fmt("vendor/curl-impersonate/{s}/libcurl-impersonate.a", .{triple})),
+        );
+        sandbox_tests.root_module.addIncludePath(b.path("vendor/curl-impersonate/include"));
+        if (target.result.os.tag == .macos) {
+            sandbox_tests.root_module.link_libcpp = true;
+            sandbox_tests.root_module.linkFramework("CoreFoundation", .{});
+            sandbox_tests.root_module.linkFramework("Security", .{});
+            sandbox_tests.root_module.linkFramework("SystemConfiguration", .{});
+            sandbox_tests.root_module.linkSystemLibrary("iconv", .{});
+            sandbox_tests.root_module.linkSystemLibrary("icucore", .{});
+        }
+        if (target.result.os.tag == .linux) {
+            sandbox_tests.root_module.link_libcpp = true;
+            sandbox_tests.root_module.linkSystemLibrary("z", .{});
+            sandbox_tests.root_module.linkSystemLibrary("pthread", .{});
+            sandbox_tests.root_module.linkSystemLibrary("dl", .{});
+            sandbox_tests.root_module.linkSystemLibrary("idn2", .{});
+        }
+        sandbox_tests.root_module.linkSystemLibrary("z", .{});
+    }
     const sandbox_test_step = b.step("test-sandbox", "Run sandbox-only tests");
     sandbox_test_step.dependOn(&b.addRunArtifact(sandbox_tests).step);
 
@@ -189,4 +252,22 @@ pub fn build(b: *std.Build) void {
     }
     const agent_step = b.step("agent", "Run kuri-agent scriptable CLI");
     agent_step.dependOn(&run_agent.step);
+}
+
+/// Map (cpu.arch, os.tag) → vendor/curl-impersonate subdir name.
+/// Returns error.UnsupportedTriple if no archive is vendored for this target.
+fn pickCurlImpersonateTriple(t: std.Target) ![]const u8 {
+    return switch (t.os.tag) {
+        .macos => switch (t.cpu.arch) {
+            .aarch64 => "aarch64-macos",
+            .x86_64 => "x86_64-macos",
+            else => error.UnsupportedTriple,
+        },
+        .linux => switch (t.cpu.arch) {
+            .aarch64 => "aarch64-linux-gnu",
+            .x86_64 => "x86_64-linux-gnu",
+            else => error.UnsupportedTriple,
+        },
+        else => error.UnsupportedTriple,
+    };
 }

@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const compat = @import("../compat.zig");
+const curl_lib = @import("curl_lib.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -229,171 +230,129 @@ pub const Response = struct {
 fn runCurlImpersonate(client: *Client, args: Client.SendArgs) !Response {
     const a = client.allocator;
 
-    // Resolve binary name.
-    var bin_buf: [64]u8 = undefined;
-    const bin_name = try client.binaryName(&bin_buf);
-
-    // If a body is provided, write it to a tempfile and reference via @path.
-    // If a body is provided, write it to a tempfile and reference via @path.
-    var body_path: ?[:0]u8 = null;
-    defer if (body_path) |p| {
-        _ = std.c.unlink(p.ptr);
-        a.free(p);
-    };
-    if (args.body) |b| {
-        if (b.len > 0) {
-            const ts: i64 = compat.milliTimestamp();
-            const path = try std.fmt.allocPrintSentinel(a, "/tmp/kuri-sandbox-{d}-{x}.body", .{ ts, std.hash.Wyhash.hash(0, b) }, 0);
-            const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-            if (fd < 0) {
-                a.free(path);
-                return error.TempFileOpenFailed;
-            }
-            defer _ = std.c.close(fd);
-            _ = std.c.write(fd, b.ptr, b.len);
-            body_path = path;
-        }
-    }
-
-    // Build argv.
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(a);
-
-    try argv.append(a, bin_name);
-    try argv.append(a, "--silent");
-    try argv.append(a, "--include");
-    try argv.append(a, "--location");
-    try argv.append(a, "--max-redirs");
-    try argv.append(a, "10");
-
-    var ct_buf: [16]u8 = undefined;
-    const ct = try std.fmt.bufPrint(&ct_buf, "{d}", .{client.options.connect_timeout_s});
-    try argv.append(a, "--connect-timeout");
-    try argv.append(a, ct);
-
-    var mt_buf: [16]u8 = undefined;
-    const mt = try std.fmt.bufPrint(&mt_buf, "{d}", .{client.options.max_total_s});
-    try argv.append(a, "--max-time");
-    try argv.append(a, mt);
-
-    // Write the response (with --include headers prefix) to a tempfile so we
-    // don't need stdout pipe collection (which OOMs in std.process.run on macOS).
-    const out_path = try std.fmt.allocPrintSentinel(a, "/tmp/kuri-sandbox-{d}-{x}.out", .{ compat.milliTimestamp(), std.hash.Wyhash.hash(1, args.url) }, 0);
+    // 1. Parse the JSON-shaped header object the runtime hands us into
+    //    a curl_lib.Header slice. headers_json may be empty.
+    const url_parsed = try parseUrl(args.url);
+    var hdr_storage: std.ArrayList(curl_lib.Header) = .empty;
+    defer hdr_storage.deinit(a);
+    var hdr_strings: std.ArrayList([]u8) = .empty;
     defer {
-        _ = std.c.unlink(out_path.ptr);
-        a.free(out_path);
-    }
-    try argv.append(a, "--output");
-    try argv.append(a, out_path);
-    try argv.append(a, "--write-out");
-    try argv.append(a, "\n%{url_effective}");
-    try argv.append(a, "--request");
-    try argv.append(a, args.method);
-
-    // Request headers.
-    var header_storage: std.ArrayList([]u8) = .empty;
-    defer {
-        for (header_storage.items) |s| a.free(s);
-        header_storage.deinit(a);
+        for (hdr_strings.items) |s| a.free(s);
+        hdr_strings.deinit(a);
     }
     if (args.headers_json.len > 0) {
-        try parseHeadersJson(a, args.headers_json, &header_storage, &argv);
+        try parseHeadersJsonInto(a, args.headers_json, &hdr_storage, &hdr_strings);
     }
 
-    // Cookie header.
-    const url_parsed = try parseUrl(args.url);
+    // 2. Cookie header from jar (libcurl-impersonate doesn't auto-scope; we do).
     var cookie_buf: std.ArrayList(u8) = .empty;
     defer cookie_buf.deinit(a);
     try args.cookie_jar.formatHeaderValue(a, url_parsed.host, &cookie_buf);
-    if (cookie_buf.items.len > 0) {
-        const cookie_arg = try std.fmt.allocPrint(a, "Cookie: {s}", .{cookie_buf.items});
-        try header_storage.append(a, cookie_arg);
-        try argv.append(a, "--header");
-        try argv.append(a, cookie_arg);
-    }
 
-
-    // Body via @path (curl reads from disk to avoid stdin pipe complexity).
-    if (body_path) |p| {
-        const data_arg = try std.fmt.allocPrint(a, "@{s}", .{p});
-        try argv.append(a, "--data-binary");
-        try argv.append(a, data_arg);
-    }
-    try argv.append(a, args.url);
-
-
-    // Build argv_z (null-terminated C strings + null sentinel) for execvp.
-    var argv_storage: std.ArrayList([:0]u8) = .empty;
-    defer {
-        for (argv_storage.items) |arg| a.free(arg);
-        argv_storage.deinit(a);
-    }
-    for (argv.items) |arg| {
-        const arg_z = try a.allocSentinel(u8, arg.len, 0);
-        @memcpy(arg_z[0..arg.len], arg);
-        try argv_storage.append(a, arg_z);
-    }
-    const argv_z = try a.alloc(?[*:0]const u8, argv_storage.items.len + 1);
-    defer a.free(argv_z);
-    for (argv_storage.items, 0..) |arg, i| argv_z[i] = arg.ptr;
-    argv_z[argv_storage.items.len] = null;
-
-    // fork + execvp (matches kuri/chrome/launcher.zig pattern; std.process.spawn
-    // OOMs on the io vtable kuri uses).
-    const pid = std.c.fork();
-    if (pid < 0) {
-        std.log.warn("[sandbox-net] fork failed", .{});
+    // 3. Run via the static-linked libcurl-impersonate.
+    var resp = curl_lib.perform(a, .{
+        .method = args.method,
+        .url = args.url,
+        .headers = hdr_storage.items,
+        .body = args.body,
+        .cookie_header = cookie_buf.items,
+        .impersonate = client.options.impersonate_profile,
+        .connect_timeout_ms = client.options.connect_timeout_s * 1000,
+        .total_timeout_ms = client.options.max_total_s * 1000,
+        .follow_redirects = true,
+        .max_redirects = 10,
+    }) catch |e| {
+        std.log.warn("[sandbox-net] curl_lib.perform failed: {s}", .{@errorName(e)});
         return error.CurlFailed;
-    }
-    if (pid == 0) {
-        // Child: redirect stdout/stderr to /dev/null then exec.
-        const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(c_uint, 0));
-        if (devnull >= 0) {
-            _ = std.c.dup2(devnull, 1);
-            _ = std.c.dup2(devnull, 2);
-            _ = std.c.close(devnull);
+    };
+    defer resp.deinit();
+
+    // 4. Parse Set-Cookie headers from the raw response header buffer and
+    //    feed them back into the jar so they're available on subsequent
+    //    requests (and reflected in the final replay response).
+    try applySetCookiesFromHeaders(args.cookie_jar, url_parsed.host, resp.raw_headers);
+
+    // 5. Build the network.Response (allocator-owned, mirrors prior shape).
+    var headers_list: std.ArrayList(Header) = .empty;
+    errdefer {
+        for (headers_list.items) |h| {
+            a.free(h.name);
+            a.free(h.value);
         }
-        _ = compat.execvp(argv_z[0].?, @ptrCast(argv_z.ptr));
-        std.c.exit(127);
+        headers_list.deinit(a);
     }
-    // Parent: waitpid for completion.
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
-    const exit_code: c_int = (status >> 8) & 0xff;
-    if (exit_code != 0) {
-        // Distinguish "binary not found" (exit 127) from "curl ran but failed".
-        if (exit_code == 127) {
-            std.log.warn(
-                "[sandbox-net] curl binary '{s}' not found on PATH. " ++
-                "Install curl-impersonate (brew install lwthiker/taps/curl-impersonate) or " ++
-                "set UNBROWSE_CURL_IMPERSONATE=/path/to/binary.",
-                .{bin_name},
-            );
-            return error.CurlBinaryMissing;
+    var status_text_owned: []u8 = try a.dupe(u8, "");
+    errdefer a.free(status_text_owned);
+
+    var line_iter = std.mem.splitSequence(u8, resp.raw_headers, "\r\n");
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "HTTP/")) {
+            // Status text after "HTTP/x.x NNN <text>".
+            const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const after = line[sp1 + 1 ..];
+            if (std.mem.indexOfScalar(u8, after, ' ')) |sp2| {
+                a.free(status_text_owned);
+                status_text_owned = try a.dupe(u8, after[sp2 + 1 ..]);
+            }
+            continue;
         }
-        std.log.warn("[sandbox-net] curl exit {d}", .{exit_code});
-        return error.CurlFailed;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (name.len == 0) continue;
+        try headers_list.append(a, .{
+            .name = try a.dupe(u8, name),
+            .value = try a.dupe(u8, value),
+        });
     }
 
-    // Read the response from the tempfile.
-    const out_fd = std.c.open(out_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (out_fd < 0) {
-        std.log.warn("[sandbox-net] cannot read curl output {s}", .{out_path});
-        return error.CurlFailed;
-    }
-    defer _ = std.c.close(out_fd);
+    return .{
+        .allocator = a,
+        .status = resp.status,
+        .status_text = status_text_owned,
+        .final_url = try a.dupe(u8, resp.final_url),
+        .headers = try headers_list.toOwnedSlice(a),
+        .body = try a.dupe(u8, resp.body),
+        .redirected = resp.redirect_count > 0,
+    };
+}
 
-    var raw = std.ArrayList(u8).empty;
-    defer raw.deinit(a);
-    var read_buf: [16 * 1024]u8 = undefined;
-    while (true) {
-        const n = std.c.read(out_fd, &read_buf, read_buf.len);
-        if (n <= 0) break;
-        try raw.appendSlice(a, read_buf[0..@intCast(n)]);
-        if (raw.items.len > client.options.max_response_bytes) return error.ResponseTooLarge;
+fn applySetCookiesFromHeaders(jar: *CookieJar, default_host: []const u8, raw: []const u8) !void {
+    var iter = std.mem.splitSequence(u8, raw, "\r\n");
+    while (iter.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "set-cookie")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        jar.applySetCookie(default_host, value) catch {};
     }
+}
 
-    return parseCurlOutput(a, raw.items, args.url, args.cookie_jar, url_parsed.host);
+fn parseHeadersJsonInto(
+    allocator: std.mem.Allocator,
+    json_str: []const u8,
+    out: *std.ArrayList(curl_lib.Header),
+    string_storage: *std.ArrayList([]u8),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        const k = entry.key_ptr.*;
+        const v_node = entry.value_ptr.*;
+        const v: []const u8 = switch (v_node) {
+            .string => |s| s,
+            else => continue,
+        };
+        const name_dup = try allocator.dupe(u8, k);
+        try string_storage.append(allocator, name_dup);
+        const value_dup = try allocator.dupe(u8, v);
+        try string_storage.append(allocator, value_dup);
+        try out.append(allocator, .{ .name = name_dup, .value = value_dup });
+    }
 }
 
 const ParsedUrl = struct {
@@ -420,120 +379,6 @@ fn parseUrl(url: []const u8) !ParsedUrl {
     return .{ .host = authority, .port = if (is_https) 443 else 80, .is_https = is_https };
 }
 
-fn parseHeadersJson(
-    allocator: std.mem.Allocator,
-    json_str: []const u8,
-    storage: *std.ArrayList([]u8),
-    argv: *std.ArrayList([]const u8),
-) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return;
-    defer parsed.deinit();
-    if (parsed.value != .object) return;
-    var it = parsed.value.object.iterator();
-    while (it.next()) |entry| {
-        const k = entry.key_ptr.*;
-        const v_node = entry.value_ptr.*;
-        const v: []const u8 = switch (v_node) {
-            .string => |s| s,
-            else => continue,
-        };
-        const arg = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ k, v });
-        try storage.append(allocator, arg);
-        try argv.append(allocator, "--header");
-        try argv.append(allocator, arg);
-    }
-}
-
-// (collectAll removed — std.process.run handles stdout/stderr collection)
-
-/// Parse curl --include output (multiple header blocks if redirected, then body,
-/// then trailing `\n%{url_effective}` from --write-out).
-fn parseCurlOutput(
-    a: std.mem.Allocator,
-    raw: []const u8,
-    request_url: []const u8,
-    jar: *CookieJar,
-    request_host: []const u8,
-) !Response {
-    // Strip the trailing url_effective line (added by --write-out).
-    // It's the last line after the body, preceded by `\n`.
-    var body_end = raw.len;
-    var final_url: []const u8 = request_url;
-    if (std.mem.lastIndexOfScalar(u8, raw, '\n')) |last_nl| {
-        const after = std.mem.trim(u8, raw[last_nl + 1 ..], " \t\r\n");
-        if (std.mem.startsWith(u8, after, "http://") or std.mem.startsWith(u8, after, "https://")) {
-            final_url = after;
-            body_end = last_nl;
-        }
-    }
-    const trimmed = raw[0..body_end];
-
-    // Split header blocks (one per redirect hop) from body.
-    // Each block ends with \r\n\r\n. The LAST block before the body is what we want.
-    var search_idx: usize = 0;
-    var last_split: usize = 0;
-    while (std.mem.indexOfPos(u8, trimmed, search_idx, "\r\n\r\n")) |pos| {
-        // If the next block starts with "HTTP/", it's another header block (redirect).
-        const next_start = pos + 4;
-        last_split = next_start;
-        if (next_start >= trimmed.len) break;
-        if (std.mem.startsWith(u8, trimmed[next_start..], "HTTP/")) {
-            search_idx = next_start;
-            continue;
-        }
-        break;
-    }
-    const header_block = trimmed[0..if (last_split > 0) last_split - 4 else trimmed.len];
-    const body = if (last_split > 0 and last_split <= trimmed.len) trimmed[last_split..] else "";
-
-    // Parse status line + headers.
-    var status: u16 = 0;
-    var status_text: []const u8 = "";
-    var headers_list = std.ArrayList(Header).empty;
-    defer headers_list.deinit(a);
-    errdefer for (headers_list.items) |h| { a.free(h.name); a.free(h.value); };
-
-    var redirected = false;
-    var line_iter = std.mem.splitSequence(u8, header_block, "\r\n");
-    var first_line = true;
-    while (line_iter.next()) |line| {
-        if (line.len == 0) continue;
-        if (std.mem.startsWith(u8, line, "HTTP/")) {
-            if (status != 0) redirected = true;
-            const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
-            const after = line[sp1 + 1 ..];
-            const sp2 = std.mem.indexOfScalar(u8, after, ' ');
-            const status_str = if (sp2) |i| after[0..i] else after;
-            status = std.fmt.parseInt(u16, status_str, 10) catch 0;
-            status_text = if (sp2) |i| after[i + 1 ..] else "";
-            first_line = false;
-            continue;
-        }
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (name.len == 0) continue;
-
-        if (std.ascii.eqlIgnoreCase(name, "set-cookie")) {
-            jar.applySetCookie(request_host, value) catch {};
-        }
-
-        try headers_list.append(a, .{
-            .name = try a.dupe(u8, name),
-            .value = try a.dupe(u8, value),
-        });
-    }
-
-    return .{
-        .allocator = a,
-        .status = status,
-        .status_text = try a.dupe(u8, status_text),
-        .final_url = try a.dupe(u8, final_url),
-        .headers = try headers_list.toOwnedSlice(a),
-        .body = try a.dupe(u8, body),
-        .redirected = redirected,
-    };
-}
 
 test "cookie jar set/get roundtrip" {
     const a = std.testing.allocator;
