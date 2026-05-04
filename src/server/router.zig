@@ -14,6 +14,7 @@ const HarRecorder = @import("../cdp/har.zig").HarRecorder;
 const CdpClient = @import("../cdp/client.zig").CdpClient;
 const auth_profiles = @import("../storage/auth_profiles.zig");
 const url_validator = @import("../crawler/validator.zig");
+const sandbox_handler = @import("../sandbox/handler.zig");
 
 pub fn run(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -262,6 +263,8 @@ fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *B
         handleWsStart(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/ws/stop")) {
         handleWsStop(request, arena, bridge);
+    } else if (std.mem.eql(u8, clean_path, "/v1/sandbox/replay")) {
+        handleSandboxReplay(request, arena);
     } else {
         resp.sendError(request, 404, "Not Found");
     }
@@ -5741,4 +5744,23 @@ test "perf/lcp route parameters" {
     try std.testing.expectEqualStrings("/perf/lcp", clean);
     try std.testing.expect(getQueryParam(path, "tab_id") != null);
     try std.testing.expect(getQueryParam(path, "url") != null);
+}
+
+// POST /v1/sandbox/replay — sandboxed bundle replay (deep-reveng).
+// See submodules/kuri/src/sandbox/handler.zig for body format.
+fn handleSandboxReplay(request: *std.http.Server.Request, arena: std.mem.Allocator) void {
+    const body = readRequestBody(request, arena) orelse {
+        resp.sendError(request, 400, "Missing JSON body");
+        return;
+    };
+    if (body.len == 0) {
+        resp.sendError(request, 400, "Empty body");
+        return;
+    }
+    const out = sandbox_handler.run(arena, body) catch |e| {
+        std.log.warn("[sandbox] replay failed: {s}", .{@errorName(e)});
+        resp.sendError(request, 500, @errorName(e));
+        return;
+    };
+    resp.sendJson(request, out);
 }

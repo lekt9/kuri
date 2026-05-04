@@ -68,6 +68,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Sandbox (bundle replay) needs QuickJS in the main exe + tests.
+    exe.root_module.addImport("quickjs", quickjs_dep.module("quickjs"));
+    exe.root_module.linkLibrary(quickjs_dep.artifact("quickjs-ng"));
+    unit_tests.root_module.addImport("quickjs", quickjs_dep.module("quickjs"));
+    unit_tests.root_module.linkLibrary(quickjs_dep.artifact("quickjs-ng"));
+
+    // Sandbox-only test step (sidesteps pre-existing chrome/launcher test bitrot).
+    const sandbox_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/sandbox_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sandbox_test_mod.addImport("quickjs", quickjs_dep.module("quickjs"));
+    const sandbox_tests = b.addTest(.{ .root_module = sandbox_test_mod });
+    sandbox_tests.root_module.linkLibrary(quickjs_dep.artifact("quickjs-ng"));
+    const sandbox_test_step = b.step("test-sandbox", "Run sandbox-only tests");
+    sandbox_test_step.dependOn(&b.addRunArtifact(sandbox_tests).step);
+
     // kuri-fetch standalone CLI (no Chrome dependency)
     const fetch_mod = b.createModule(.{
         .root_source_file = b.path("src/fetch_main.zig"),
