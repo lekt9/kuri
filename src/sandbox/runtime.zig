@@ -385,7 +385,11 @@ fn jsNativeFetch(ctx_opt: ?*quickjs.Context, _: quickjs.Value, args: []const qui
     obj.setPropertyStr(ctx, "url", quickjs.Value.initStringLen(ctx, response.final_url)) catch {};
     obj.setPropertyStr(ctx, "redirected", quickjs.Value.initBool(response.redirected)) catch {};
     obj.setPropertyStr(ctx, "body", quickjs.Value.initStringLen(ctx, response.body)) catch {};
-
+    // bodyBytes: binary-safe byte view alongside body. unbrowse SandboxImpersonatingClient
+    // (src/http/sandbox-impersonate.ts) reads this so gzipped/protobuf/image/gRPC responses
+    // survive the Node-side reconstruction unmangled. body stays for backward-compat with
+    // existing skill code; bodyBytes is the new path.
+    obj.setPropertyStr(ctx, "bodyBytes", quickjs.Value.initUint8ArrayCopy(ctx, response.body)) catch {};
     // Headers as a plain object {name: value}.
     const hdrs_obj = quickjs.Value.initObject(ctx);
     for (response.headers) |h| {
