@@ -64,6 +64,7 @@ const c = struct {
     const CURLOPT_COOKIE: CURLoption = 10022;
     const CURLOPT_USERAGENT: CURLoption = 10018;
     const CURLOPT_ACCEPT_ENCODING: CURLoption = 10102;
+    const CURLOPT_PROXY: CURLoption = 10004;
 
     extern "c" fn curl_easy_init() ?*CURL;
     extern "c" fn curl_easy_cleanup(handle: *CURL) void;
@@ -102,6 +103,9 @@ pub const Request = struct {
     total_timeout_ms: u32 = 30_000,
     follow_redirects: bool = true,
     max_redirects: u32 = 10,
+    /// Optional proxy URL — e.g. "http://user:pass@host:port" or "socks5://host:port".
+    /// libcurl parses user:pass from the URL, so no separate USERPWD setopt needed.
+    proxy: ?[]const u8 = null,
 };
 
 pub const Response = struct {
@@ -165,6 +169,14 @@ pub fn perform(allocator: std.mem.Allocator, req: Request) Error!Response {
     defer allocator.free(url_z);
     try setoptCheck(easy, c.CURLOPT_URL, url_z.ptr);
 
+    // 2b. Proxy (optional). libcurl honors user:pass embedded in the URL,
+    // so a single setopt is sufficient for "http://user:pass@host:port".
+    var proxy_z: ?[:0]u8 = null;
+    defer if (proxy_z) |p| allocator.free(p);
+    if (req.proxy) |p| {
+        proxy_z = try allocator.dupeZ(u8, p);
+        try setoptCheck(easy, c.CURLOPT_PROXY, proxy_z.?.ptr);
+    }
     // 3. Method.
     const method_z = try allocator.dupeZ(u8, req.method);
     defer allocator.free(method_z);
