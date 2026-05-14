@@ -2,6 +2,23 @@
 
 All notable changes to kuri are documented here.
 
+## [0.3.4-preview.1] — 2026-05-14
+
+### Stealth (preview)
+- **`Function.prototype.toString` proxy** — patched getters now report `[native code]` when introspected via `.toString()`. This closes the biggest remaining detection vector — scripts that walk navigator descriptors and call `.toString()` on the getter to see if it leaked a JS body.
+- **`chrome.app` stub** — adds the missing `chrome.app` object with `isInstalled`, `InstallState`, `RunningState`, `getDetails`, `getIsInstalled`. Real Chrome always has this; absence is a tell.
+- **Enriched `chrome.runtime`** — full enum surface (`OnInstalledReason`, `PlatformOs`, `PlatformArch`, etc.) matching real Chrome shape.
+- **`permissions.query` notifications fix** — returns `'default'` instead of reading `Notification.permission` (which is `'denied'` in headless, mismatching the permissions API).
+- **`mediaDevices.enumerateDevices` fallback** — returns plausible default devices instead of empty array (headless tell).
+- **`outerWidth`/`outerHeight` fallback** — when headless reports 0, fall back to `innerWidth`/`innerHeight`.
+- **Plugin polyfill methods** — `plugins.item()`, `.namedItem()`, `.refresh()` now exist and report as native.
+
+### Source-of-truth cleanup
+- Removed top-level `js/stealth.js` (191-line duplicate that never compiled in). Single source of truth is now `src/cdp/js/stealth.js`, which `@embedFile` actually resolves to.
+
+### Release plumbing
+- Release workflow detects pre-release tag suffixes (`-preview`, `-rc`, `-beta`, `-alpha`) and publishes them as GitHub pre-releases under a `preview/` channel directory instead of `stable/`.
+
 ## [0.3.3] — 2026-04-25
 
 ### Fixes

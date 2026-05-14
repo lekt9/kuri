@@ -152,11 +152,21 @@ jobs:
         with:
           merge-multiple: true
           path: dist
-      - name: Publish stable channel
+      - name: Publish release channel
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
-          CHANNEL_DIR="channel/stable/${VERSION}"
+
+          # Pre-release tags publish to channel/preview/ instead of channel/stable/
+          # so unbrowse-side stable update checks don't pick them up.
+          if [[ "$VERSION" =~ -(preview|rc|beta|alpha) ]]; then
+            CHANNEL="preview"
+          else
+            CHANNEL="stable"
+          fi
+          export CHANNEL
+
+          CHANNEL_DIR="channel/${CHANNEL}/${VERSION}"
           mkdir -p "$CHANNEL_DIR"
           cp dist/*.tar.gz "$CHANNEL_DIR/"
 
@@ -169,9 +179,10 @@ jobs:
 
           version = os.environ["GITHUB_REF_NAME"]
           commit = os.environ["GITHUB_SHA"]
+          channel = os.environ["CHANNEL"]
           root = Path("channel")
-          version_dir = root / "stable" / version
-          base = "https://raw.githubusercontent.com/justrach/kuri/release-channel/stable"
+          version_dir = root / channel / version
+          base = f"https://raw.githubusercontent.com/justrach/kuri/release-channel/{channel}"
           assets = {}
 
           for path in sorted(version_dir.glob("kuri-*.tar.gz")):
@@ -184,7 +195,7 @@ jobs:
               }
 
           manifest = {
-              "channel": "stable",
+              "channel": channel,
               "version": version,
               "commit": commit,
               "published_at": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -192,7 +203,7 @@ jobs:
               "assets": assets,
           }
 
-          (root / "stable" / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          (root / channel / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
           (version_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
           with (version_dir / "sha256sums.txt").open("w") as out:
               for target, meta in assets.items():
@@ -213,14 +224,21 @@ jobs:
           Manifest:
 
           - https://raw.githubusercontent.com/justrach/kuri/release-channel/stable/latest.json
+
+          ## Preview
+
+          Pre-release tags (`-preview`, `-rc`, `-beta`, `-alpha`) publish under `preview/` instead of `stable/`:
+
+          - https://raw.githubusercontent.com/justrach/kuri/release-channel/preview/latest.json
           EOF
 
           cd channel
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.md stable
-          git commit -m "release: publish stable ${VERSION}" || exit 0
+          git add README.md "${CHANNEL}"
+          git commit -m "release: publish ${CHANNEL} ${VERSION}" || exit 0
           git push origin HEAD:release-channel
+
 
   publish-github-release:
     needs: [build-linux, build-macos-arm, build-macos-x86]
@@ -274,9 +292,18 @@ jobs:
           NOTES="dist/release-notes.md"
           ASSETS=(dist/*.tar.gz "dist/kuri-${VERSION}-sha256sums.txt")
 
+          # Detect pre-release suffixes (-preview, -rc, -beta, -alpha) and pass
+          # --prerelease instead of --latest so previews don't promote to latest
+          # in unbrowse-side update checks.
+          if [[ "$VERSION" =~ -(preview|rc|beta|alpha) ]]; then
+            LATEST_FLAGS=(--prerelease --latest=false)
+          else
+            LATEST_FLAGS=(--latest)
+          fi
+
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release upload "$VERSION" "${ASSETS[@]}" --clobber
-            gh release edit "$VERSION" --title "$TITLE" --notes-file "$NOTES" --latest
+            gh release edit "$VERSION" --title "$TITLE" --notes-file "$NOTES" "${LATEST_FLAGS[@]}"
           else
-            gh release create "$VERSION" "${ASSETS[@]}" --title "$TITLE" --notes-file "$NOTES" --latest
+            gh release create "$VERSION" "${ASSETS[@]}" --title "$TITLE" --notes-file "$NOTES" "${LATEST_FLAGS[@]}"
           fi
