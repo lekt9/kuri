@@ -1276,6 +1276,17 @@ fn handleEvaluate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
     const target = request.head.target;
     const tab_id = requireEffectiveTabId(arena, request, bridge) orelse return;
 
+    // Snapshot the session id BEFORE reading the request body. Zig's
+    // std.http.Server.Request.iterateHeaders() asserts the reader is still in
+    // .received_head state; readRequestBody() (readerExpectNone) advances it
+    // past that, so any header access after the body read panics with
+    // "reached unreachable code". Resolve it once here and reuse it below
+    // instead of calling rememberCurrentTab() (which re-reads headers).
+    const session_snapshot: ?[]const u8 = if (getSessionId(request)) |sid|
+        (arena.dupe(u8, sid) catch null)
+    else
+        null;
+
     // Support both POST body and query param for expression.
     // POST body is preferred for large scripts that exceed URL length limits.
     const expr_raw = blk: {
@@ -1304,7 +1315,7 @@ fn handleEvaluate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         resp.sendError(request, 404, "Tab not found");
         return;
     };
-    rememberCurrentTab(request, bridge, tab_id);
+    if (session_snapshot) |sid| bridge.setCurrentTab(sid, tab_id) catch {};
     _ = bridge.touchTab(tab_id);
 
     const escaped_expr = jsonEscapeAlloc(arena, expr) orelse {
