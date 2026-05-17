@@ -176,6 +176,15 @@ pub const Launcher = struct {
             for (flags) |f| try argv_list.append(self.allocator, f);
         }
 
+        // Open the initial tab on about:blank instead of letting headless
+        // Chrome fall to its privileged chrome://newtab/ NTP. The NTP target
+        // lingers forever in tab discovery and becomes a silent wrong-tab
+        // fallback when a session's tab_id can't be resolved (the observed
+        // "snap shows New Incognito tab" wedge). about:blank is a benign,
+        // non-WebUI placeholder with no target-rotation behavior. Trailing
+        // positional arg = URL Chrome opens at launch.
+        try argv_list.append(self.allocator, "about:blank");
+
         // Build null-terminated argv for execv
         var argv_storage: std.ArrayList([:0]u8) = .empty;
         defer {
