@@ -158,6 +158,16 @@ pub const Launcher = struct {
         try argv_list.append(self.allocator, "--disable-background-networking");
         try argv_list.append(self.allocator, "--disable-dev-shm-usage");
         try argv_list.append(self.allocator, "--window-size=1920,1080");
+        // Parallel multi-tab: headless Chrome renderer-backgrounds and
+        // timer-throttles non-foreground targets, so concurrent snap/eval
+        // on N tabs starves all but the active one (empty a11y tree).
+        // These are the standard Playwright/Puppeteer flags that keep every
+        // tab rendering regardless of foreground, required for the parallel
+        // gate collector. Generic, not a per-site hack.
+        try argv_list.append(self.allocator, "--disable-background-timer-throttling");
+        try argv_list.append(self.allocator, "--disable-backgrounding-occluded-windows");
+        try argv_list.append(self.allocator, "--disable-renderer-backgrounding");
+        try argv_list.append(self.allocator, "--disable-features=CalculateNativeWinOcclusion");
 
         if (self.proxy) |proxy_url| {
             const proxy_flag = try std.fmt.allocPrint(self.allocator, "--proxy-server={s}", .{proxy_url});
