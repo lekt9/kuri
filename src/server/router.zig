@@ -388,10 +388,34 @@ fn activateTarget(arena: std.mem.Allocator, bridge: *Bridge, tab_id: []const u8)
     return true;
 }
 
+// Target.closeTarget MUST NOT be issued over the target's OWN page
+// session. Chrome tears the /devtools/page/<id> websocket down as it
+// closes that target, so a fire-and-forget command races the teardown
+// and is silently dropped: the Chrome tab survives while handleClose
+// still removeTab()s it, so tabs accumulate across sessions and a later
+// session->tab resolve binds to a stale leftover tab (cross-probe
+// contamination). Issue closeTarget over a SIBLING tab's session (which
+// outlives the close), and confirm the response, mirroring how
+// Target.createTarget reliably issues over a non-self session.
+fn siblingCdpClient(arena: std.mem.Allocator, bridge: *Bridge, exclude_tab_id: []const u8) ?*CdpClient {
+    const tabs = bridge.listTabs(arena) catch return null;
+    for (tabs) |tab| {
+        if (std.mem.eql(u8, tab.id, exclude_tab_id)) continue;
+        if (bridge.getCdpClient(tab.id)) |client| return client;
+    }
+    return null;
+}
+
 fn closeTarget(arena: std.mem.Allocator, bridge: *Bridge, tab_id: []const u8) bool {
-    const client = anyCdpClient(arena, bridge, tab_id) orelse return false;
+    // Prefer a sibling session; fall back to the target's own session
+    // only when it is the sole tab (degenerate case, not the bug above).
+    const client = siblingCdpClient(arena, bridge, tab_id) orelse anyCdpClient(arena, bridge, tab_id) orelse return false;
     const params = std.fmt.allocPrint(arena, "{{\"targetId\":\"{s}\"}}", .{tab_id}) catch return false;
-    _ = client.send(arena, protocol.Methods.target_close_target, params) catch return false;
+    const response = client.send(arena, protocol.Methods.target_close_target, params) catch return false;
+    // Success: {"result":{"success":true}} (or {}); any "error" member or
+    // an empty body means the target did NOT close.
+    if (response.len == 0) return false;
+    if (std.mem.indexOf(u8, response, "\"error\"") != null) return false;
     return true;
 }
 
