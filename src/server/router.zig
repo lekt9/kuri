@@ -2190,9 +2190,26 @@ fn handleCookies(request: *std.http.Server.Request, arena: std.mem.Allocator, br
     const value = getQueryParam(target, "value");
 
     if (name != null and value != null) {
-        // Set cookie
+        // Set cookie.
+        //
+        // B-023 fix 2026-05-19: Chrome's Network.setCookie silently drops
+        // cookies when called on a tab whose current page can't host the
+        // cookie's domain (e.g. about:blank). The `url` parameter tells
+        // Chrome the URL context to use for the cookie's origin; with it
+        // set, the cookie persists into the browser's main jar regardless
+        // of what page the tab is currently displaying. Pre-fix, fresh
+        // tabs spawned via newTab(about:blank) accepted setCookie calls
+        // but no cookies landed in the jar (kuri /cookies endpoint
+        // appeared to PASS but Network.getCookies always returned []).
         const domain = getQueryParam(target, "domain") orelse "localhost";
-        const params = std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"value\":\"{s}\",\"domain\":\"{s}\",\"path\":\"/\"}}", .{ name.?, value.?, domain }) catch {
+        // Strip leading dot from cookie-domain when building the URL —
+        // ".google.com" → "https://google.com/".
+        const url_domain = if (domain.len > 0 and domain[0] == '.') domain[1..] else domain;
+        const url = std.fmt.allocPrint(arena, "https://{s}/", .{url_domain}) catch {
+            resp.sendError(request, 500, "Internal Server Error");
+            return;
+        };
+        const params = std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"value\":\"{s}\",\"domain\":\"{s}\",\"path\":\"/\",\"url\":\"{s}\"}}", .{ name.?, value.?, domain, url }) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
@@ -2202,8 +2219,15 @@ fn handleCookies(request: *std.http.Server.Request, arena: std.mem.Allocator, br
         };
         resp.sendJson(request, response);
     } else {
-        // Get all cookies
-        const response = client.send(arena, "Network.getCookies", null) catch {
+        // Get all cookies.
+        //
+        // B-023 fix 2026-05-19: Network.getCookies with null params returns
+        // only cookies visible to the CURRENT PAGE URL. On about:blank that's
+        // an empty array regardless of what's in the jar. Use getAllCookies
+        // to return everything Chrome has stored — the caller (TS-side
+        // importBrowserCookiesIntoTab + F2 honest-counter read) filters by
+        // domain client-side.
+        const response = client.send(arena, "Network.getAllCookies", null) catch {
             resp.sendError(request, 502, "CDP command failed");
             return;
         };
