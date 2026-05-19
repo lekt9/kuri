@@ -42,19 +42,36 @@ pub fn isatty(fd: c_int) bool {
 
 // --- Time ---
 
+// Win32 time/sleep (Zig 0.16 std.os.windows binds neither; std.time
+// lacks milli/nanoTimestamp in 0.16 so derive everything from FILETIME).
+extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *win.FILETIME) callconv(.winapi) void;
+extern "kernel32" fn Sleep(dwMilliseconds: win.DWORD) callconv(.winapi) void;
+
+/// 100-ns intervals since the Unix epoch, from the Windows wall clock.
+fn winUnix100ns() i128 {
+    var ft: win.FILETIME = undefined;
+    GetSystemTimeAsFileTime(&ft);
+    const ticks: u64 = (@as(u64, ft.dwHighDateTime) << 32) | @as(u64, ft.dwLowDateTime);
+    // FILETIME epoch is 1601-01-01; Unix epoch is 11644473600 s later.
+    return @as(i128, ticks) - 116444736000000000;
+}
+
 pub fn timestampSeconds() i64 {
+    if (is_windows) return @intCast(@divTrunc(winUnix100ns(), 10_000_000));
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
     return ts.sec;
 }
 
 pub fn milliTimestamp() i64 {
+    if (is_windows) return @intCast(@divTrunc(winUnix100ns(), 10_000));
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
 pub fn nanoTimestamp() i128 {
+    if (is_windows) return winUnix100ns() * 100;
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
     return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
@@ -63,6 +80,10 @@ pub fn nanoTimestamp() i128 {
 // --- Threading ---
 
 pub fn threadSleep(ns: u64) void {
+    if (is_windows) {
+        Sleep(@intCast(ns / std.time.ns_per_ms));
+        return;
+    }
     const ts = std.c.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
         .nsec = @intCast(ns % std.time.ns_per_s),
@@ -177,7 +198,37 @@ pub fn writeToStderr(data: []const u8) void {
 
 // --- Filesystem (cwd operations using C calls) ---
 
+// Win32 file APIs (Zig 0.16 std.os.windows does not bind these; raw
+// DWORD ABI with stable documented constant values). std.c.fd_t is
+// windows.HANDLE on Windows, so CreateFileW's HANDLE threads through
+// the existing fd_t signatures unchanged.
+extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: win.DWORD, dwShareMode: win.DWORD, lpSecurityAttributes: ?*win.SECURITY_ATTRIBUTES, dwCreationDisposition: win.DWORD, dwFlagsAndAttributes: win.DWORD, hTemplateFile: ?win.HANDLE) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn CreateDirectoryW(lpPathName: [*:0]const u16, lpSecurityAttributes: ?*win.SECURITY_ATTRIBUTES) callconv(.winapi) win.BOOL;
+extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.winapi) win.BOOL;
+extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) win.DWORD;
+const W_GENERIC_READ: win.DWORD = 0x80000000;
+const W_GENERIC_WRITE: win.DWORD = 0x40000000;
+const W_FILE_SHARE_READ: win.DWORD = 0x00000001;
+const W_CREATE_ALWAYS: win.DWORD = 2;
+const W_OPEN_EXISTING: win.DWORD = 3;
+const W_FILE_ATTRIBUTE_NORMAL: win.DWORD = 0x80;
+
+/// UTF-8 path -> NUL-terminated UTF-16 in a caller stack buffer.
+fn winPathW(buf: []u16, path: []const u8) ![:0]u16 {
+    if (path.len + 1 >= buf.len) return error.NameTooLong;
+    const n = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], path) catch return error.NameTooLong;
+    buf[n] = 0;
+    return buf[0..n :0];
+}
+
 pub fn cwdCreateFile(path: []const u8) !std.c.fd_t {
+    if (is_windows) {
+        var wbuf: [4096]u16 = undefined;
+        const wp = try winPathW(&wbuf, path);
+        const h = CreateFileW(wp.ptr, W_GENERIC_WRITE, W_FILE_SHARE_READ, null, W_CREATE_ALWAYS, W_FILE_ATTRIBUTE_NORMAL, null);
+        if (h == win.INVALID_HANDLE_VALUE) return error.FileNotFound;
+        return h;
+    }
     var buf: [4096]u8 = undefined;
     if (path.len >= buf.len) return error.NameTooLong;
     @memcpy(buf[0..path.len], path);
@@ -188,6 +239,24 @@ pub fn cwdCreateFile(path: []const u8) !std.c.fd_t {
 }
 
 pub fn cwdReadFile(allocator: std.mem.Allocator, path: []const u8, max_size: usize) ![]u8 {
+    if (is_windows) {
+        var wbuf: [4096]u16 = undefined;
+        const wp = try winPathW(&wbuf, path);
+        const h = CreateFileW(wp.ptr, W_GENERIC_READ, W_FILE_SHARE_READ, null, W_OPEN_EXISTING, W_FILE_ATTRIBUTE_NORMAL, null);
+        if (h == win.INVALID_HANDLE_VALUE) return error.FileNotFound;
+        defer win.CloseHandle(h);
+        var result = std.ArrayList(u8).empty;
+        var read_buf: [8192]u8 = undefined;
+        while (true) {
+            var got: win.DWORD = 0;
+            const ok = ReadFile(h, &read_buf, @intCast(read_buf.len), &got, null);
+            if (!ok.toBool() or got == 0) break;
+            const bytes: usize = @intCast(got);
+            if (result.items.len + bytes > max_size) return error.FileTooBig;
+            try result.appendSlice(allocator, read_buf[0..bytes]);
+        }
+        return result.toOwnedSlice(allocator);
+    }
     var buf: [4096]u8 = undefined;
     if (path.len >= buf.len) return error.NameTooLong;
     @memcpy(buf[0..path.len], path);
@@ -210,7 +279,17 @@ pub fn cwdReadFile(allocator: std.mem.Allocator, path: []const u8, max_size: usi
 
 pub fn cwdWriteFile(path: []const u8, data: []const u8) !void {
     const fd = try cwdCreateFile(path);
-    defer _ = std.c.close(fd);
+    defer fdClose(fd);
+    if (is_windows) {
+        var sent: usize = 0;
+        while (sent < data.len) {
+            var wrote: win.DWORD = 0;
+            if (!WriteFile(fd, data[sent..].ptr, @intCast(data.len - sent), &wrote, null).toBool()) return error.WriteError;
+            if (wrote == 0) return error.WriteError;
+            sent += wrote;
+        }
+        return;
+    }
     var sent: usize = 0;
     while (sent < data.len) {
         const n = std.c.write(fd, data[sent..].ptr, data.len - sent);
@@ -220,20 +299,31 @@ pub fn cwdWriteFile(path: []const u8, data: []const u8) !void {
 }
 
 pub fn cwdMakePath(path: []const u8) !void {
-    // Iteratively create each component
     var i: usize = 0;
     while (i < path.len) {
         i += 1;
         while (i < path.len and path[i] != '/') : (i += 1) {}
-        var buf: [4096]u8 = undefined;
-        if (i > buf.len - 1) return error.NameTooLong;
-        @memcpy(buf[0..i], path[0..i]);
-        buf[i] = 0;
-        _ = std.c.mkdir(buf[0..i :0], 0o755);
+        if (is_windows) {
+            var wbuf: [4096]u16 = undefined;
+            const wp = try winPathW(&wbuf, path[0..i]);
+            _ = CreateDirectoryW(wp.ptr, null); // ignore "already exists"
+        } else {
+            var buf: [4096]u8 = undefined;
+            if (i > buf.len - 1) return error.NameTooLong;
+            @memcpy(buf[0..i], path[0..i]);
+            buf[i] = 0;
+            _ = std.c.mkdir(buf[0..i :0], 0o755);
+        }
     }
 }
 
 pub fn cwdDeleteFile(path: []const u8) !void {
+    if (is_windows) {
+        var wbuf: [4096]u16 = undefined;
+        const wp = try winPathW(&wbuf, path);
+        if (!DeleteFileW(wp.ptr).toBool()) return error.FileNotFound;
+        return;
+    }
     var buf: [4096]u8 = undefined;
     if (path.len >= buf.len) return error.NameTooLong;
     @memcpy(buf[0..path.len], path);
@@ -242,6 +332,11 @@ pub fn cwdDeleteFile(path: []const u8) !void {
 }
 
 pub fn cwdAccess(path: []const u8) bool {
+    if (is_windows) {
+        var wbuf: [4096]u16 = undefined;
+        const wp = winPathW(&wbuf, path) catch return false;
+        return GetFileAttributesW(wp.ptr) != win.INVALID_FILE_ATTRIBUTES;
+    }
     var buf: [4096]u8 = undefined;
     if (path.len >= buf.len) return false;
     @memcpy(buf[0..path.len], path);
@@ -250,6 +345,16 @@ pub fn cwdAccess(path: []const u8) bool {
 }
 
 pub fn fdWriteAll(fd: std.c.fd_t, data: []const u8) !void {
+    if (is_windows) {
+        var sent: usize = 0;
+        while (sent < data.len) {
+            var wrote: win.DWORD = 0;
+            if (!WriteFile(fd, data[sent..].ptr, @intCast(data.len - sent), &wrote, null).toBool()) return error.WriteError;
+            if (wrote == 0) return error.WriteError;
+            sent += wrote;
+        }
+        return;
+    }
     var sent: usize = 0;
     while (sent < data.len) {
         const n = std.c.write(fd, data[sent..].ptr, data.len - sent);
@@ -259,6 +364,10 @@ pub fn fdWriteAll(fd: std.c.fd_t, data: []const u8) !void {
 }
 
 pub fn fdClose(fd: std.c.fd_t) void {
+    if (is_windows) {
+        win.CloseHandle(fd);
+        return;
+    }
     _ = std.c.close(fd);
 }
 
