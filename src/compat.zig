@@ -1,5 +1,44 @@
 /// Zig 0.16 compatibility shims for removed stdlib APIs.
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Windows port seam. compat.zig was POSIX-modeled (libc fork/exec/raw
+/// BSD sockets) to dodge removed std.fs/std.net/std.process. On Windows
+/// those std.c symbols differ or do not exist; primitives that are
+/// genuinely OS-specific branch on this. Pure-libc primitives whose
+/// std.c signature is already correct on win (fd_t variables, not int
+/// literals) need no branch.
+pub const is_windows = builtin.os.tag == .windows;
+const win = std.os.windows;
+
+// Zig 0.16 std.os.windows does NOT bind GetStdHandle / WriteFile /
+// GetConsoleMode. Declare them directly (same pattern this file already
+// uses for `extern "c" fn execvp`). Only referenced under a comptime
+// is_windows branch, so non-windows builds never link them.
+extern "kernel32" fn GetStdHandle(nStdHandle: win.DWORD) callconv(.winapi) ?win.HANDLE;
+extern "kernel32" fn WriteFile(
+    hFile: win.HANDLE,
+    lpBuffer: [*]const u8,
+    nNumberOfBytesToWrite: win.DWORD,
+    lpNumberOfBytesWritten: *win.DWORD,
+    lpOverlapped: ?*anyopaque,
+) callconv(.winapi) win.BOOL;
+extern "kernel32" fn GetConsoleMode(hConsoleHandle: win.HANDLE, lpMode: *win.DWORD) callconv(.winapi) win.BOOL;
+const STD_OUTPUT_HANDLE: win.DWORD = @bitCast(@as(i32, -11));
+const STD_ERROR_HANDLE: win.DWORD = @bitCast(@as(i32, -12));
+
+/// stderr/stdout TTY detection. POSIX: libc isatty. Windows: a console
+/// handle answers GetConsoleMode (a pipe/file does not), which is the
+/// correct "is this an interactive terminal" test on win.
+pub fn isatty(fd: c_int) bool {
+    if (is_windows) {
+        const h = GetStdHandle(if (fd == 2) STD_ERROR_HANDLE else STD_OUTPUT_HANDLE) orelse return false;
+        if (h == win.INVALID_HANDLE_VALUE) return false;
+        var mode: win.DWORD = undefined;
+        return GetConsoleMode(h, &mode).toBool();
+    }
+    return std.c.isatty(fd) != 0;
+}
 
 // --- Time ---
 
@@ -107,22 +146,33 @@ pub fn getenv(name: []const u8) ?[]const u8 {
 
 // --- Filesystem (replaces removed std.fs.cwd / std.fs.File) ---
 
-pub fn writeToStdout(data: []const u8) void {
+fn writeToStdHandle(comptime fd_posix: c_int, comptime win_handle: win.DWORD, data: []const u8) void {
+    if (is_windows) {
+        const h = GetStdHandle(win_handle) orelse return;
+        if (h == win.INVALID_HANDLE_VALUE) return;
+        var sent: usize = 0;
+        while (sent < data.len) {
+            var wrote: win.DWORD = 0;
+            if (!WriteFile(h, data[sent..].ptr, @intCast(data.len - sent), &wrote, null).toBool()) break;
+            if (wrote == 0) break;
+            sent += wrote;
+        }
+        return;
+    }
     var sent: usize = 0;
     while (sent < data.len) {
-        const n = std.c.write(1, data[sent..].ptr, data.len - sent);
+        const n = std.c.write(fd_posix, data[sent..].ptr, data.len - sent);
         if (n <= 0) break;
         sent += @intCast(n);
     }
 }
 
+pub fn writeToStdout(data: []const u8) void {
+    writeToStdHandle(1, STD_OUTPUT_HANDLE, data);
+}
+
 pub fn writeToStderr(data: []const u8) void {
-    var sent: usize = 0;
-    while (sent < data.len) {
-        const n = std.c.write(2, data[sent..].ptr, data.len - sent);
-        if (n <= 0) break;
-        sent += @intCast(n);
-    }
+    writeToStdHandle(2, STD_ERROR_HANDLE, data);
 }
 
 // --- Filesystem (cwd operations using C calls) ---
