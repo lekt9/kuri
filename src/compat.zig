@@ -26,7 +26,26 @@ extern "kernel32" fn WriteFile(
 extern "kernel32" fn GetConsoleMode(hConsoleHandle: win.HANDLE, lpMode: *win.DWORD) callconv(.winapi) win.BOOL;
 const STD_OUTPUT_HANDLE: win.DWORD = @bitCast(@as(i32, -11));
 const STD_ERROR_HANDLE: win.DWORD = @bitCast(@as(i32, -12));
+const STD_INPUT_HANDLE: win.DWORD = @bitCast(@as(i32, -10));
 
+/// stdin fd/handle for the interactive REPL. POSIX: fd 0. Windows: the
+/// real std-input HANDLE (fd_t is HANDLE on Windows, 0 is not valid).
+pub fn stdinHandle() std.posix.fd_t {
+    if (is_windows) return GetStdHandle(STD_INPUT_HANDLE) orelse win.INVALID_HANDLE_VALUE;
+    return 0;
+}
+
+/// Read from a raw fd/handle. std.posix.read is @compileError on Windows
+/// in Zig 0.16, so Windows goes through ReadFile.
+pub fn readFd(fd: std.posix.fd_t, buf: []u8) !usize {
+    if (is_windows) {
+        var got: win.DWORD = 0;
+        const ok = ReadFile(fd, buf.ptr, @intCast(buf.len), &got, null);
+        if (!ok.toBool()) return error.ReadError;
+        return got;
+    }
+    return std.posix.read(fd, buf);
+}
 /// stderr/stdout TTY detection. POSIX: libc isatty. Windows: a console
 /// handle answers GetConsoleMode (a pipe/file does not), which is the
 /// correct "is this an interactive terminal" test on win.
@@ -91,34 +110,72 @@ pub fn threadSleep(ns: u64) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
+// Threading: POSIX pthread mutex/rwlock; Windows SRWLOCK (canonical
+// slim reader/writer lock, non-recursive like the pthread defaults so
+// behavior is at parity). std.c.pthread_* is void on Windows.
+const SRWLOCK = extern struct { Ptr: ?*anyopaque = null };
+extern "kernel32" fn AcquireSRWLockExclusive(s: *SRWLOCK) callconv(.winapi) void;
+extern "kernel32" fn ReleaseSRWLockExclusive(s: *SRWLOCK) callconv(.winapi) void;
+extern "kernel32" fn TryAcquireSRWLockExclusive(s: *SRWLOCK) callconv(.winapi) u8;
+extern "kernel32" fn AcquireSRWLockShared(s: *SRWLOCK) callconv(.winapi) void;
+extern "kernel32" fn ReleaseSRWLockShared(s: *SRWLOCK) callconv(.winapi) void;
+
+const MutexInner = if (is_windows) SRWLOCK else std.c.pthread_mutex_t;
+const RwLockInner = if (is_windows) SRWLOCK else std.c.pthread_rwlock_t;
+
 pub const PthreadMutex = struct {
-    inner: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    inner: MutexInner = if (is_windows) .{} else std.c.PTHREAD_MUTEX_INITIALIZER,
 
     pub fn lock(m: *PthreadMutex) void {
-        _ = std.c.pthread_mutex_lock(&m.inner);
+        if (is_windows) {
+            AcquireSRWLockExclusive(&m.inner);
+        } else {
+            _ = std.c.pthread_mutex_lock(&m.inner);
+        }
     }
     pub fn unlock(m: *PthreadMutex) void {
-        _ = std.c.pthread_mutex_unlock(&m.inner);
+        if (is_windows) {
+            ReleaseSRWLockExclusive(&m.inner);
+        } else {
+            _ = std.c.pthread_mutex_unlock(&m.inner);
+        }
     }
     pub fn tryLock(m: *PthreadMutex) bool {
+        if (is_windows) return TryAcquireSRWLockExclusive(&m.inner) != 0;
         return @intFromEnum(std.c.pthread_mutex_trylock(&m.inner)) == 0;
     }
 };
 
 pub const PthreadRwLock = struct {
-    inner: std.c.pthread_rwlock_t = .{},
+    inner: RwLockInner = if (is_windows) .{} else .{},
 
     pub fn lock(rw: *PthreadRwLock) void {
-        _ = std.c.pthread_rwlock_wrlock(&rw.inner);
+        if (is_windows) {
+            AcquireSRWLockExclusive(&rw.inner);
+        } else {
+            _ = std.c.pthread_rwlock_wrlock(&rw.inner);
+        }
     }
     pub fn unlock(rw: *PthreadRwLock) void {
-        _ = std.c.pthread_rwlock_unlock(&rw.inner);
+        if (is_windows) {
+            ReleaseSRWLockExclusive(&rw.inner);
+        } else {
+            _ = std.c.pthread_rwlock_unlock(&rw.inner);
+        }
     }
     pub fn lockShared(rw: *PthreadRwLock) void {
-        _ = std.c.pthread_rwlock_rdlock(&rw.inner);
+        if (is_windows) {
+            AcquireSRWLockShared(&rw.inner);
+        } else {
+            _ = std.c.pthread_rwlock_rdlock(&rw.inner);
+        }
     }
     pub fn unlockShared(rw: *PthreadRwLock) void {
-        _ = std.c.pthread_rwlock_unlock(&rw.inner);
+        if (is_windows) {
+            ReleaseSRWLockShared(&rw.inner);
+        } else {
+            _ = std.c.pthread_rwlock_unlock(&rw.inner);
+        }
     }
 };
 
@@ -551,11 +608,136 @@ pub fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8, max_ou
     };
 }
 
+// --- Detached process management (Chrome launcher: spawn + supervise +
+// kill). POSIX = fork/exec/waitpid/kill; Windows = CreateProcessW +
+// WaitForSingleObject + TerminateProcess. ChildProc is the seam type.
+extern "kernel32" fn TerminateProcess(hProcess: win.HANDLE, uExitCode: win.DWORD) callconv(.winapi) win.BOOL;
+
+pub const ChildProc = if (is_windows) win.HANDLE else std.c.pid_t;
+
+/// Spawn argv detached (stdout/stderr discarded), return a handle/pid the
+/// caller supervises with waitProc / killProc.
+pub fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) !ChildProc {
+    if (is_windows) {
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(allocator);
+        for (argv, 0..) |arg, i| {
+            if (i != 0) try cmd.append(allocator, ' ');
+            try winAppendQuotedArg(&cmd, allocator, arg);
+        }
+        const wcmd = try std.unicode.utf8ToUtf16LeAllocZ(allocator, cmd.items);
+        defer allocator.free(wcmd);
+
+        const nul = CreateFileW(std.unicode.utf8ToUtf16LeStringLiteral("NUL"), W_GENERIC_WRITE, W_FILE_SHARE_READ, null, W_OPEN_EXISTING, W_FILE_ATTRIBUTE_NORMAL, null);
+        defer if (nul != win.INVALID_HANDLE_VALUE) win.CloseHandle(nul);
+
+        var si = std.mem.zeroes(win.STARTUPINFOW);
+        si.cb = @sizeOf(win.STARTUPINFOW);
+        if (nul != win.INVALID_HANDLE_VALUE) {
+            si.dwFlags = win.STARTF_USESTDHANDLES;
+            si.hStdInput = null;
+            si.hStdOutput = nul;
+            si.hStdError = nul;
+        }
+        var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
+        if (!win.kernel32.CreateProcessW(
+            null,
+            wcmd.ptr,
+            null,
+            null,
+            win.BOOL.TRUE,
+            win.CreateProcessFlags{},
+            null,
+            null,
+            &si,
+            &pi,
+        ).toBool()) return error.ForkFailed;
+        win.CloseHandle(pi.hThread);
+        return pi.hProcess;
+    }
+
+    var arg_storage: std.ArrayList([:0]u8) = .empty;
+    defer {
+        for (arg_storage.items) |a| allocator.free(a);
+        arg_storage.deinit(allocator);
+    }
+    for (argv) |arg| {
+        const duped = try allocator.allocSentinel(u8, arg.len, 0);
+        @memcpy(duped[0..arg.len], arg);
+        try arg_storage.append(allocator, duped);
+    }
+    const c_argv = try allocator.alloc(?[*:0]const u8, arg_storage.items.len + 1);
+    defer allocator.free(c_argv);
+    for (arg_storage.items, 0..) |a, i| c_argv[i] = a.ptr;
+    c_argv[arg_storage.items.len] = null;
+
+    const pid = std.c.fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid == 0) {
+        const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        if (devnull >= 0) {
+            _ = std.c.dup2(devnull, 1);
+            _ = std.c.dup2(devnull, 2);
+            _ = std.c.close(devnull);
+        }
+        _ = execvp(c_argv[0].?, @ptrCast(c_argv.ptr));
+        std.c._exit(127);
+    }
+    return pid;
+}
+
+pub fn waitProc(p: ChildProc) void {
+    if (is_windows) {
+        _ = WaitForSingleObject(p, 0xFFFFFFFF);
+        win.CloseHandle(p);
+        return;
+    }
+    _ = std.c.waitpid(p, null, 0);
+}
+
+pub fn killProc(p: ChildProc) void {
+    if (is_windows) {
+        _ = TerminateProcess(p, 1);
+        _ = WaitForSingleObject(p, 0xFFFFFFFF);
+        win.CloseHandle(p);
+        return;
+    }
+    _ = std.c.kill(p, std.c.SIG.KILL);
+    _ = std.c.waitpid(p, null, 0);
+}
 // --- Networking (replaces removed std.net) ---
 
 const c = std.c;
 const fd_t = std.c.fd_t;
 const native_endian = @import("builtin").cpu.arch.endian();
+
+// Windows socket layer = Winsock2. SOCKET is UINT_PTR (usize), NOT an
+// int and NOT the HANDLE that fd_t is on Windows, so the stream/server
+// store a Socket-seam type. ws2_32 funcs are unbound in Zig 0.16
+// (ws2_32.zig has only the constants/structs); self-declared, same
+// proven pattern as the kernel32 externs.
+const ws = std.os.windows.ws2_32;
+const Socket = if (is_windows) usize else fd_t;
+const WSADATA = extern struct { _opaque: [512]u8 };
+extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) callconv(.winapi) c_int;
+extern "ws2_32" fn socket(af: c_int, type: c_int, protocol: c_int) callconv(.winapi) usize;
+extern "ws2_32" fn connect(s: usize, name: *const ws.sockaddr, namelen: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn bind(s: usize, name: *const ws.sockaddr, namelen: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn listen(s: usize, backlog: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn wsAccept(s: usize, addr: ?*ws.sockaddr, addrlen: ?*c_int) callconv(.winapi) usize;
+extern "ws2_32" fn recv(s: usize, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn send(s: usize, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn closesocket(s: usize) callconv(.winapi) c_int;
+extern "ws2_32" fn setsockopt(s: usize, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
+
+const WINSOCK_INVALID: usize = ~@as(usize, 0);
+var wsa_started: bool = false;
+fn ensureWsa() void {
+    if (wsa_started) return;
+    var d: WSADATA = undefined;
+    _ = WSAStartup(0x0202, &d); // MAKEWORD(2,2); idempotent/refcounted
+    wsa_started = true;
+}
 
 fn htons(val: u16) u16 {
     return if (native_endian == .little) @byteSwap(val) else val;
@@ -567,6 +749,14 @@ fn ntohs(val: u16) u16 {
 
 /// Try to connect to 127.0.0.1:port. Returns true if connection succeeded.
 pub fn isPortInUse(port: u16) bool {
+    if (is_windows) {
+        ensureWsa();
+        const s = socket(ws.AF.INET, ws.SOCK.STREAM, 0);
+        if (s == WINSOCK_INVALID) return false;
+        defer _ = closesocket(s);
+        var addr = ws.sockaddr.in{ .port = htons(port), .addr = 0x0100007F };
+        return connect(s, @ptrCast(&addr), @sizeOf(ws.sockaddr.in)) == 0;
+    }
     const fd = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
     if (fd < 0) return false;
     defer _ = c.close(fd);
@@ -580,42 +770,77 @@ pub fn isPortInUse(port: u16) bool {
     return rc == 0;
 }
 
-/// A minimal TCP stream wrapping a C socket fd.
+/// A minimal TCP stream wrapping a socket (fd_t on POSIX, SOCKET on win).
 pub const TcpStream = struct {
-    fd: fd_t,
+    fd: Socket,
 
     pub fn close(self: TcpStream) void {
-        _ = c.close(self.fd);
+        if (is_windows) {
+            _ = closesocket(self.fd);
+        } else {
+            _ = c.close(self.fd);
+        }
     }
 
     pub fn writeAll(self: TcpStream, data: []const u8) !void {
         var sent: usize = 0;
         while (sent < data.len) {
-            const n = c.write(self.fd, data[sent..].ptr, data.len - sent);
-            if (n <= 0) return error.BrokenPipe;
-            sent += @intCast(n);
+            if (is_windows) {
+                const n = send(self.fd, data[sent..].ptr, @intCast(data.len - sent), 0);
+                if (n <= 0) return error.BrokenPipe;
+                sent += @intCast(n);
+            } else {
+                const n = c.write(self.fd, data[sent..].ptr, data.len - sent);
+                if (n <= 0) return error.BrokenPipe;
+                sent += @intCast(n);
+            }
         }
     }
 
     pub fn read(self: TcpStream, buf: []u8) !usize {
+        if (is_windows) {
+            const n = recv(self.fd, buf.ptr, @intCast(buf.len), 0);
+            if (n < 0) return error.ConnectionResetByPeer;
+            return @intCast(n);
+        }
         const n = c.read(self.fd, buf.ptr, buf.len);
         if (n < 0) return error.ConnectionResetByPeer;
         return @intCast(n);
     }
 
     pub fn write(self: TcpStream, data: []const u8) !usize {
+        if (is_windows) {
+            const n = send(self.fd, data.ptr, @intCast(data.len), 0);
+            if (n <= 0) return error.BrokenPipe;
+            return @intCast(n);
+        }
         const n = c.write(self.fd, data.ptr, data.len);
         if (n <= 0) return error.BrokenPipe;
         return @intCast(n);
     }
 
     pub fn setSockOpt(self: TcpStream, level: i32, optname: u32, optval: []const u8) void {
-        _ = c.setsockopt(self.fd, level, optname, optval.ptr, @intCast(optval.len));
+        if (is_windows) {
+            _ = setsockopt(self.fd, @intCast(level), @intCast(optname), optval.ptr, @intCast(optval.len));
+        } else {
+            _ = c.setsockopt(self.fd, level, optname, optval.ptr, @intCast(optval.len));
+        }
     }
 };
 
 /// Connect to 127.0.0.1:port via TCP. Returns a TcpStream.
 pub fn tcpConnectToIp4(port: u16) !TcpStream {
+    if (is_windows) {
+        ensureWsa();
+        const s = socket(ws.AF.INET, ws.SOCK.STREAM, 0);
+        if (s == WINSOCK_INVALID) return error.SocketCreateFailed;
+        var addr = ws.sockaddr.in{ .port = htons(port), .addr = 0x0100007F };
+        if (connect(s, @ptrCast(&addr), @sizeOf(ws.sockaddr.in)) != 0) {
+            _ = closesocket(s);
+            return error.ConnectionRefused;
+        }
+        return .{ .fd = s };
+    }
     const fd = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketCreateFailed;
 
@@ -641,25 +866,46 @@ pub fn tcpConnectToHost(host: []const u8, port: u16) !TcpStream {
 
 /// A minimal TCP server that binds and listens.
 pub const TcpServer = struct {
-    fd: fd_t,
+    fd: Socket,
 
     pub const Connection = struct {
         stream: TcpStream,
     };
 
     pub fn accept(self: TcpServer) !Connection {
+        if (is_windows) {
+            const cs = wsAccept(self.fd, null, null);
+            if (cs == WINSOCK_INVALID) return error.AcceptFailed;
+            return .{ .stream = .{ .fd = cs } };
+        }
         const client_fd = c.accept(self.fd, null, null);
         if (client_fd < 0) return error.AcceptFailed;
         return .{ .stream = .{ .fd = client_fd } };
     }
 
     pub fn deinit(self: *TcpServer) void {
-        _ = c.close(self.fd);
+        if (is_windows) {
+            _ = closesocket(self.fd);
+        } else {
+            _ = c.close(self.fd);
+        }
     }
 };
 
 /// Bind and listen on 127.0.0.1:port.
 pub fn tcpListen(port: u16) !TcpServer {
+    if (is_windows) {
+        ensureWsa();
+        const s = socket(ws.AF.INET, ws.SOCK.STREAM, 0);
+        if (s == WINSOCK_INVALID) return error.SocketCreateFailed;
+        errdefer _ = closesocket(s);
+        const one: c_int = 1;
+        _ = setsockopt(s, ws.SOL.SOCKET, ws.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
+        var addr = ws.sockaddr.in{ .port = htons(port), .addr = 0x0100007F };
+        if (bind(s, @ptrCast(&addr), @sizeOf(ws.sockaddr.in)) != 0) return error.AddressInUse;
+        if (listen(s, 1) != 0) return error.ListenFailed;
+        return .{ .fd = s };
+    }
     const fd = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketCreateFailed;
     errdefer _ = c.close(fd);

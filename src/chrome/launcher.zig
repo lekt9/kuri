@@ -10,7 +10,7 @@ pub const Launcher = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     cdp_port: u16,
-    child_pid: ?std.c.pid_t,
+    child_pid: ?compat.ChildProc,
     ws_url_buf: [512]u8,
     ws_url_len: usize,
     restarts: u8,
@@ -195,41 +195,9 @@ pub const Launcher = struct {
         // positional arg = URL Chrome opens at launch.
         try argv_list.append(self.allocator, "about:blank");
 
-        // Build null-terminated argv for execv
-        var argv_storage: std.ArrayList([:0]u8) = .empty;
-        defer {
-            for (argv_storage.items) |arg| self.allocator.free(arg);
-            argv_storage.deinit(self.allocator);
-        }
-        for (argv_list.items) |arg| {
-            const arg_z = try self.allocator.allocSentinel(u8, arg.len, 0);
-            @memcpy(arg_z[0..arg.len], arg);
-            try argv_storage.append(self.allocator, arg_z);
-        }
-
-        const argv_z = try self.allocator.alloc(?[*:0]const u8, argv_storage.items.len + 1);
-        defer self.allocator.free(argv_z);
-        for (argv_storage.items, 0..) |arg, i| {
-            argv_z[i] = arg.ptr;
-        }
-        argv_z[argv_storage.items.len] = null;
-
-        const pid = std.c.fork();
-        if (pid < 0) return error.ForkFailed;
-
-        if (pid == 0) {
-            // Child: redirect stdout/stderr to /dev/null
-            const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(c_uint, 0));
-            if (devnull >= 0) {
-                _ = std.c.dup2(devnull, 1);
-                _ = std.c.dup2(devnull, 2);
-                _ = std.c.close(devnull);
-            }
-            _ = compat.execvp(argv_z[0].?, @ptrCast(argv_z.ptr));
-            std.c.exit(127);
-        }
-
-        self.child_pid = pid;
+        // Spawn Chrome detached (stdout/stderr discarded). POSIX forks/
+        // execs; Windows uses CreateProcessW. Seam in compat.
+        self.child_pid = try compat.spawnDetached(self.allocator, argv_list.items);
 
         // Free argv-owned strings now that fork+exec has completed.
         self.allocator.free(port_flag);
@@ -254,8 +222,7 @@ pub const Launcher = struct {
             }
         }
 
-        std.log.info("launched Chrome (pid={d}) on CDP port {d}", .{
-            pid,
+        std.log.info("launched Chrome on CDP port {d}", .{
             self.cdp_port,
         });
         if (builtin_path != null) {
@@ -284,7 +251,7 @@ pub const Launcher = struct {
 
         // Chrome appears dead
         if (self.child_pid) |pid| {
-            _ = std.c.waitpid(pid, null, 0);
+            compat.waitProc(pid);
             self.child_pid = null;
         }
 
@@ -305,8 +272,7 @@ pub const Launcher = struct {
     /// Shut down the managed Chrome process.
     pub fn deinit(self: *Launcher) void {
         if (self.child_pid) |pid| {
-            _ = std.c.kill(pid, std.c.SIG.KILL);
-            _ = std.c.waitpid(pid, null, 0);
+            compat.killProc(pid);
             self.child_pid = null;
         }
         if (self.builtin_ext_path) |bp| {

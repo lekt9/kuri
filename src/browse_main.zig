@@ -193,7 +193,7 @@ const Browser = struct {
     }
 
     fn repl(self: *Browser) void {
-        const stdin_fd: std.posix.fd_t = 0;
+        const stdin_fd: std.posix.fd_t = compat.stdinHandle();
         var line_buf: [4096]u8 = undefined;
 
         while (true) {
@@ -657,7 +657,7 @@ fn findLinkNum(links: []const []const u8, url: []const u8, fallback: usize) usiz
 fn readLine(fd: std.posix.fd_t, buf: []u8) ?[]const u8 {
     var i: usize = 0;
     while (i < buf.len) {
-        const bytes_read = std.posix.read(fd, buf[i .. i + 1]) catch return null;
+        const bytes_read = compat.readFd(fd, buf[i .. i + 1]) catch return null;
         if (bytes_read == 0) {
             if (i == 0) return null; // EOF with no data
             return buf[0..i];

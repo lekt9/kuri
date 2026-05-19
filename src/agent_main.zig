@@ -1334,50 +1334,25 @@ fn saveSession(arena: std.mem.Allocator, session: *Session) !void {
 
 // ── Chrome tab discovery ──────────────────────────────────────────────────────
 
-extern "c" fn connect(sock: std.c.fd_t, addr: *const std.posix.sockaddr, addrlen: std.posix.socklen_t) c_int;
-
 fn fetchChromeTabs(arena: std.mem.Allocator, host: []const u8, port: u16) ![]const u8 {
     _ = host;
-    // Create TCP socket
-    const raw_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (raw_fd < 0) return error.ConnectionRefused;
-    const fd: std.posix.fd_t = raw_fd;
+    // Connect via the compat socket layer (POSIX fd / Winsock seam).
+    var stream = compat.tcpConnectToIp4(port) catch return error.ConnectionRefused;
+    defer stream.close();
 
-    // Connect to 127.0.0.1:port
-    var addr: std.posix.sockaddr.in = .{
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7f000001), // 127.0.0.1
-    };
-    if (connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) != 0) {
-        _ = std.c.close(fd);
-        return error.ConnectionRefused;
-    }
-
-    // Set receive timeout
-    const timeout = std.posix.timeval{ .sec = 3, .usec = 0 };
-    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-
-    // Send HTTP request
+    // Send HTTP request. "Connection: close" makes the server close the
+    // socket after the response, so the read loop terminates on EOF.
     const req = try std.fmt.allocPrint(arena, "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n", .{port});
-    var sent: usize = 0;
-    while (sent < req.len) {
-        const n = std.c.write(fd, req.ptr + sent, req.len - sent);
-        if (n <= 0) {
-            _ = std.c.close(fd);
-            return error.WriteFailed;
-        }
-        sent += @intCast(n);
-    }
+    try stream.writeAll(req);
 
     // Read response
     var buf: [65536]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = std.posix.read(fd, buf[total..]) catch break;
+        const n = stream.read(buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
-    _ = std.c.close(fd);
 
     const raw = buf[0..total];
     const body_start = (std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidResponse) + 4;
