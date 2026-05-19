@@ -266,7 +266,124 @@ pub fn fdClose(fd: std.c.fd_t) void {
 
 pub extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 
+// Win32 process/pipe APIs Zig 0.16 std.os.windows does NOT bind
+// (CreateProcessW IS bound at std.os.windows.kernel32). Self-declared,
+// same proven pattern as the GetStdHandle externs above. Referenced
+// only under the comptime is_windows branch.
+extern "kernel32" fn CreatePipe(hReadPipe: *win.HANDLE, hWritePipe: *win.HANDLE, lpPipeAttributes: ?*win.SECURITY_ATTRIBUTES, nSize: win.DWORD) callconv(.winapi) win.BOOL;
+extern "kernel32" fn ReadFile(hFile: win.HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: win.DWORD, lpNumberOfBytesRead: *win.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) win.BOOL;
+extern "kernel32" fn WaitForSingleObject(hHandle: win.HANDLE, dwMilliseconds: win.DWORD) callconv(.winapi) win.DWORD;
+extern "kernel32" fn GetExitCodeProcess(hProcess: win.HANDLE, lpExitCode: *win.DWORD) callconv(.winapi) win.BOOL;
+extern "kernel32" fn SetHandleInformation(hObject: win.HANDLE, dwMask: win.DWORD, dwFlags: win.DWORD) callconv(.winapi) win.BOOL;
+
+/// Append one argv element to a Windows command line using the documented
+/// CommandLineToArgvW quoting rules (backslash/quote runs handled).
+fn winAppendQuotedArg(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
+    var needs_quote = arg.len == 0;
+    for (arg) |ch| {
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == 0x0B or ch == '"') {
+            needs_quote = true;
+            break;
+        }
+    }
+    if (!needs_quote) {
+        try buf.appendSlice(allocator, arg);
+        return;
+    }
+    try buf.append(allocator, '"');
+    var backslashes: usize = 0;
+    for (arg) |ch| {
+        if (ch == '\\') {
+            backslashes += 1;
+        } else if (ch == '"') {
+            for (0..backslashes * 2 + 1) |_| try buf.append(allocator, '\\');
+            try buf.append(allocator, '"');
+            backslashes = 0;
+        } else {
+            for (0..backslashes) |_| try buf.append(allocator, '\\');
+            backslashes = 0;
+            try buf.append(allocator, ch);
+        }
+    }
+    for (0..backslashes * 2) |_| try buf.append(allocator, '\\');
+    try buf.append(allocator, '"');
+}
+
 pub fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8, max_output: usize) !struct { stdout: []u8, term: i32 } {
+    if (is_windows) {
+        // Build the Windows command line (single mutable UTF-16 string).
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(allocator);
+        for (argv, 0..) |arg, i| {
+            if (i != 0) try cmd.append(allocator, ' ');
+            try winAppendQuotedArg(&cmd, allocator, arg);
+        }
+        const wcmd = try std.unicode.utf8ToUtf16LeAllocZ(allocator, cmd.items);
+        defer allocator.free(wcmd);
+
+        var sa = win.SECURITY_ATTRIBUTES{
+            .nLength = @sizeOf(win.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = null,
+            .bInheritHandle = win.BOOL.TRUE,
+        };
+        var rd: win.HANDLE = undefined;
+        var wr: win.HANDLE = undefined;
+        if (!CreatePipe(&rd, &wr, &sa, 0).toBool()) return error.PipeCreateFailed;
+        errdefer {
+            win.CloseHandle(rd);
+            win.CloseHandle(wr);
+        }
+        // Read end must not be inherited by the child.
+        _ = SetHandleInformation(rd, 1, 0); // HANDLE_FLAG_INHERIT = 1
+
+        var si = std.mem.zeroes(win.STARTUPINFOW);
+        si.cb = @sizeOf(win.STARTUPINFOW);
+        si.dwFlags = win.STARTF_USESTDHANDLES;
+        si.hStdInput = null;
+        si.hStdOutput = wr;
+        si.hStdError = wr;
+        var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
+
+        if (!win.kernel32.CreateProcessW(
+            null,
+            wcmd.ptr,
+            null,
+            null,
+            win.BOOL.TRUE,
+            win.CreateProcessFlags{},
+            null,
+            null,
+            &si,
+            &pi,
+        ).toBool()) return error.ForkFailed;
+
+        // Parent: close the write end so ReadFile sees EOF on child exit.
+        win.CloseHandle(wr);
+        defer win.CloseHandle(rd);
+        defer win.CloseHandle(pi.hProcess);
+        defer win.CloseHandle(pi.hThread);
+
+        var result: std.ArrayList(u8) = .empty;
+        var read_buf: [4096]u8 = undefined;
+        while (true) {
+            var got: win.DWORD = 0;
+            const ok = ReadFile(rd, &read_buf, @intCast(read_buf.len), &got, null);
+            if (!ok.toBool() or got == 0) break;
+            const bytes: usize = @intCast(got);
+            if (result.items.len + bytes > max_output) break;
+            try result.appendSlice(allocator, read_buf[0..bytes]);
+        }
+
+        _ = WaitForSingleObject(pi.hProcess, 0xFFFFFFFF); // INFINITE
+        var code: win.DWORD = 0;
+        _ = GetExitCodeProcess(pi.hProcess, &code);
+
+        return .{
+            .stdout = try result.toOwnedSlice(allocator),
+            .term = @intCast(code),
+        };
+    }
+
     var arg_storage: std.ArrayList([:0]u8) = .empty;
     defer {
         for (arg_storage.items) |arg| allocator.free(arg);
