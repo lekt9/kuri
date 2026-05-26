@@ -2,13 +2,19 @@ const std = @import("std");
 const crypto = std.crypto;
 const compat = @import("../compat.zig");
 
-const c_connect = @extern(*const fn (std.c.fd_t, *const anyopaque, std.posix.socklen_t) callconv(.c) c_int, .{ .name = "connect" });
-
 /// Pure Zig WebSocket client for CDP communication.
 /// Implements RFC 6455: HTTP upgrade handshake, masked client frames, unmasked server reads.
+///
+/// Socket layer routed through compat.TcpStream so the same code compiles on
+/// POSIX (fd = c_int via std.c) and Windows (fd = SOCKET via WSASocketW).
+/// Pre-2026-05-26 this file called std.c.socket() + extern("connect") + std.posix
+/// directly; that failed at compile time on x86_64-windows-gnu because
+/// std.posix.fd_t is *anyopaque on Windows but std.c.socket returns c_int, and
+/// std.posix.SO.RCVTIMEO hits @compileError("unsupported OS"). The compat layer
+/// abstracts the ABI difference.
 pub const WebSocketClient = struct {
     allocator: std.mem.Allocator,
-    fd: std.posix.fd_t,
+    stream: compat.TcpStream,
     connected: bool,
 
     // Buffers owned by caller (stack or heap)
@@ -31,30 +37,20 @@ pub const WebSocketClient = struct {
 
         // Resolve localhost to 127.0.0.1 — resolveIp fails on some systems
         const resolved_host = if (std.mem.eql(u8, parsed.host, "localhost")) "127.0.0.1" else parsed.host;
-        const ip_addr = parseIp4(resolved_host) orelse return Error.ConnectionFailed;
 
-        const raw_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        if (raw_fd < 0) return Error.ConnectionFailed;
-        const fd: std.posix.fd_t = raw_fd;
-        errdefer _ = std.c.close(fd);
+        // compat.tcpConnectToHost handles socket+connect on both POSIX and
+        // Windows. It currently hard-resolves to 127.0.0.1 internally (all
+        // CDP traffic is loopback), so passing the parsed host is a no-op
+        // hint — kept for clarity / future when arbitrary-host CDP lands.
+        const stream = compat.tcpConnectToHost(resolved_host, parsed.port) catch return Error.ConnectionFailed;
+        errdefer stream.close();
 
-        var addr: std.posix.sockaddr.in = .{
-            .port = std.mem.nativeToBig(u16, parsed.port),
-            .addr = ip_addr,
-        };
-        if (c_connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) != 0) {
-            return Error.ConnectionFailed;
-        }
-
-        // Set read timeout so we don't block forever
-        const timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
-        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {
-            return Error.ConnectionFailed;
-        };
+        // Set read timeout so we don't block forever (10 sec).
+        compat.setRecvTimeoutSec(stream, 10);
 
         var ws = WebSocketClient{
             .allocator = allocator,
-            .fd = fd,
+            .stream = stream,
             .connected = false,
             .read_buf = read_buf,
             .write_buf = write_buf,
@@ -91,7 +87,7 @@ pub const WebSocketClient = struct {
             self.writeFrame(0x8, &.{}) catch {};
             self.connected = false;
         }
-        _ = std.c.close(self.fd);
+        self.stream.close();
     }
 
     // --- Internal ---
@@ -226,16 +222,11 @@ pub const WebSocketClient = struct {
     }
 
     fn writeAll(self: *WebSocketClient, data: []const u8) !void {
-        var sent: usize = 0;
-        while (sent < data.len) {
-            const n = std.c.write(self.fd, data.ptr + sent, data.len - sent);
-            if (n <= 0) return Error.WriteFailed;
-            sent += @intCast(n);
-        }
+        self.stream.writeAll(data) catch return Error.WriteFailed;
     }
 
     fn rawRead(self: *WebSocketClient, buf: []u8) !usize {
-        return std.posix.read(self.fd, buf) catch return Error.ReadFailed;
+        return self.stream.read(buf) catch return Error.ReadFailed;
     }
 
     fn writeFrame(self: *WebSocketClient, opcode: u8, data: []const u8) !void {

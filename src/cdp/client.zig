@@ -250,10 +250,13 @@ pub const CdpClient = struct {
         defer self.mu.unlock();
 
         var ws = &(self.ws orelse return);
-        const drain_timeout = std.posix.timeval{ .sec = timeout_sec, .usec = 0 };
-        const orig_timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
-        std.posix.setsockopt(ws.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&drain_timeout)) catch {};
-        defer std.posix.setsockopt(ws.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&orig_timeout)) catch {};
+        // Route through compat.setRecvTimeoutSec so this compiles on both
+        // POSIX (std.posix.timeval) and Windows (DWORD ms). Pre-2026-05-26
+        // this called std.posix.setsockopt directly and exposed ws.fd; the
+        // WebSocketClient now wraps a compat.TcpStream and exposes
+        // ws.stream which the helper accepts.
+        compat.setRecvTimeoutSec(ws.stream, timeout_sec);
+        defer compat.setRecvTimeoutSec(ws.stream, 10);
 
         var drained: u32 = 0;
         while (drained < 2000) : (drained += 1) {

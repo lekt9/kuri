@@ -864,6 +864,32 @@ pub fn tcpConnectToHost(host: []const u8, port: u16) !TcpStream {
     return tcpConnectToIp4(port);
 }
 
+/// Set SO_RCVTIMEO on a stream. POSIX uses timeval { sec, usec };
+/// Windows uses DWORD milliseconds. Constants gated by `is_windows` so
+/// neither branch references std.posix.SO.RCVTIMEO (the comptime resolution
+/// hits @compileError("unsupported OS") on Windows even when guarded by
+/// runtime branches — std lib quirk in Zig 0.16).
+pub fn setRecvTimeoutSec(stream: TcpStream, secs: i32) void {
+    // `if (comptime is_windows)` forces Zig to comptime-eliminate the dead
+    // branch instead of merely runtime-skipping it. Required because the
+    // else-branch's `std.posix.timeval` / `std.posix.SO.RCVTIMEO` accesses
+    // hit @compileError("unsupported OS") + "use std.Io instead" on
+    // Windows during type elaboration even when the runtime branch never
+    // executes. Compile-time elimination skips elaboration entirely.
+    if (comptime is_windows) {
+        const ms: u32 = @intCast(@max(secs, 0) * @as(i32, 1000));
+        // Windows SO_RCVTIMEO = 0x1006 in SOL_SOCKET (0xffff).
+        stream.setSockOpt(0xffff, 0x1006, std.mem.asBytes(&ms));
+    } else {
+        const timeout = std.posix.timeval{ .sec = secs, .usec = 0 };
+        stream.setSockOpt(
+            @intCast(@as(u32, std.posix.SOL.SOCKET)),
+            @intCast(@as(u32, std.posix.SO.RCVTIMEO)),
+            std.mem.asBytes(&timeout),
+        );
+    }
+}
+
 /// A minimal TCP server that binds and listens.
 pub const TcpServer = struct {
     fd: Socket,
