@@ -1376,30 +1376,26 @@ pub fn discoverTabs(arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_
     const host = cdp_addr.host;
     const port = cdp_addr.port;
 
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const address = net.IpAddress.parseIp4(host, port) catch return error.CannotResolveChromeAddress;
-    const stream = net.IpAddress.connect(&address, io, .{ .mode = .stream }) catch return error.CannotConnectToChrome;
-    defer stream.close(io);
+    // Cross-platform TCP via compat.TcpStream. The previous std.net /
+    // std.posix.read path @compileError'd on Windows ("use std.Io
+    // instead" / "unsupported OS"). compat.tcpConnectToHost wraps
+    // POSIX socket() + connect() on macOS/Linux and ws2_32 WSAStartup +
+    // socket() + connect() on Windows.
+    const stream = compat.tcpConnectToHost(host, port) catch return error.CannotConnectToChrome;
+    defer stream.close();
 
-    // Set read timeout (2 seconds) to avoid blocking forever
-    const timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    // Set read timeout (2 seconds) to avoid blocking forever.
+    compat.setRecvTimeoutSec(stream, 2);
 
     // HTTP/1.1 required — Chrome ignores HTTP/1.0
     const http_req = try std.fmt.allocPrint(arena, "GET /json/list HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n", .{ host, port });
-    // Write request using raw syscall
-    var written: usize = 0;
-    while (written < http_req.len) {
-        const rc = std.c.write(stream.socket.handle, http_req.ptr + written, http_req.len - written);
-        if (rc <= 0) return error.CannotConnectToChrome;
-        written += @intCast(rc);
-    }
+    stream.writeAll(http_req) catch return error.CannotConnectToChrome;
 
     // Read response with Content-Length awareness
     var response_buf: [65536]u8 = undefined;
     var total: usize = 0;
     while (total < response_buf.len) {
-        const n = std.posix.read(stream.socket.handle, response_buf[total..]) catch break;
+        const n = stream.read(response_buf[total..]) catch break;
         if (n == 0) break;
         total += n;
         // Once we have headers, check Content-Length to know when body is complete
@@ -1473,7 +1469,6 @@ pub fn discoverTabs(arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_
 fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16) void {
     const registered = discoverTabs(arena, bridge, cfg, cdp_port) catch |err| {
         switch (err) {
-            error.CannotResolveChromeAddress => resp.sendError(request, 502, "Cannot resolve Chrome address"),
             error.CannotConnectToChrome => resp.sendError(request, 502, "Cannot connect to Chrome"),
             error.EmptyResponseFromChrome => resp.sendError(request, 502, "Empty response from Chrome"),
             error.InvalidChromeResponse => resp.sendError(request, 502, "Invalid response from Chrome"),

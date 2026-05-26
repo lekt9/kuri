@@ -111,23 +111,20 @@ pub fn listProfiles(
     const dir_path = try authProfilesDir(allocator, state_dir);
     defer allocator.free(dir_path);
 
-    var path_buf: [4096]u8 = undefined;
-    if (dir_path.len >= path_buf.len) return error.NameTooLong;
-    @memcpy(path_buf[0..dir_path.len], dir_path);
-    path_buf[dir_path.len] = 0;
-    const dir_z: [*:0]const u8 = path_buf[0..dir_path.len :0];
-
-    const dp = std.c.opendir(dir_z) orelse return allocator.alloc(AuthProfileMeta, 0);
-    defer _ = std.c.closedir(dp);
+    // Cross-platform directory enumeration via compat primitive. POSIX
+    // uses opendir/readdir/closedir; Windows uses FindFirstFileW family.
+    const names = compat.listDirNames(allocator, dir_path) catch
+        return allocator.alloc(AuthProfileMeta, 0);
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
 
     var list: std.ArrayList(AuthProfileMeta) = .empty;
     defer list.deinit(allocator);
 
-    while (std.c.readdir(dp)) |entry| {
-        const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
-        const name = std.mem.sliceTo(name_ptr, 0);
+    for (names) |name| {
         if (!std.mem.endsWith(u8, name, ".meta.json")) continue;
-
         const safe_name = name[0 .. name.len - ".meta.json".len];
         const meta = readMetaFile(allocator, dir_path, safe_name) catch continue;
         try list.append(allocator, meta);

@@ -401,6 +401,81 @@ pub fn cwdAccess(path: []const u8) bool {
     return std.c.access(buf[0..path.len :0], std.c.F_OK) == 0;
 }
 
+// Windows directory enumeration primitives. POSIX uses std.c.opendir +
+// readdir + closedir; mingw libc has no opendir, so Windows shells out
+// to the kernel32 FindFirstFileW family. Same struct layout the OS
+// gives us; we only read cFileName.
+const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: win.DWORD,
+    ftCreationTime: win.FILETIME,
+    ftLastAccessTime: win.FILETIME,
+    ftLastWriteTime: win.FILETIME,
+    nFileSizeHigh: win.DWORD,
+    nFileSizeLow: win.DWORD,
+    dwReserved0: win.DWORD,
+    dwReserved1: win.DWORD,
+    cFileName: [260]u16,
+    cAlternateFileName: [14]u16,
+};
+extern "kernel32" fn FindFirstFileW(lpFileName: [*:0]const u16, lpFindFileData: *WIN32_FIND_DATAW) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn FindNextFileW(hFindFile: win.HANDLE, lpFindFileData: *WIN32_FIND_DATAW) callconv(.winapi) win.BOOL;
+extern "kernel32" fn FindClose(hFindFile: win.HANDLE) callconv(.winapi) win.BOOL;
+
+/// List filenames (non-recursive) inside `dir_path`. Returns owned []u8 slices;
+/// caller frees each entry AND the outer slice. Excludes "." and "..".
+/// Returns an empty slice when the directory doesn't exist or can't be opened
+/// (POSIX: opendir == null; Windows: FindFirstFileW == INVALID_HANDLE).
+///
+/// POSIX uses std.c.opendir/readdir/closedir. Windows uses FindFirstFileW +
+/// FindNextFileW + FindClose with a "<dir>\\*" search glob. Pattern parallels
+/// the existing cwdMakePath + cwdAccess primitives — same `if (is_windows)`
+/// branch shape, same UTF-8 ↔ UTF-16LE conversion via winPathW.
+pub fn listDirNames(allocator: std.mem.Allocator, dir_path: []const u8) ![][]u8 {
+    var list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (list.items) |s| allocator.free(s);
+        list.deinit(allocator);
+    }
+
+    if (is_windows) {
+        // Win32 FindFirstFileW wants "<dir>\\*" as the search pattern.
+        const glob = try std.fmt.allocPrint(allocator, "{s}\\*", .{dir_path});
+        defer allocator.free(glob);
+        var wbuf: [4096]u16 = undefined;
+        const wp = winPathW(&wbuf, glob) catch return try list.toOwnedSlice(allocator);
+        var data: WIN32_FIND_DATAW = undefined;
+        const h = FindFirstFileW(wp.ptr, &data);
+        if (h == win.INVALID_HANDLE_VALUE) return try list.toOwnedSlice(allocator);
+        defer _ = FindClose(h);
+        while (true) {
+            const name_len = std.mem.indexOfScalar(u16, &data.cFileName, 0) orelse data.cFileName.len;
+            if (name_len > 0) {
+                const name_u8 = try std.unicode.utf16LeToUtf8Alloc(allocator, data.cFileName[0..name_len]);
+                if (std.mem.eql(u8, name_u8, ".") or std.mem.eql(u8, name_u8, "..")) {
+                    allocator.free(name_u8);
+                } else {
+                    try list.append(allocator, name_u8);
+                }
+            }
+            if (!FindNextFileW(h, &data).toBool()) break;
+        }
+    } else {
+        const path_z = try allocator.dupeZ(u8, dir_path);
+        defer allocator.free(path_z);
+        const dp = std.c.opendir(path_z.ptr) orelse return try list.toOwnedSlice(allocator);
+        defer _ = std.c.closedir(dp);
+        while (std.c.readdir(dp)) |entry| {
+            const name_ptr: [*:0]const u8 = @ptrCast(&entry.d_name);
+            const name = std.mem.sliceTo(name_ptr, 0);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const copy = try allocator.dupe(u8, name);
+            try list.append(allocator, copy);
+        }
+    }
+
+    return try list.toOwnedSlice(allocator);
+}
+
 pub fn fdWriteAll(fd: std.c.fd_t, data: []const u8) !void {
     if (is_windows) {
         var sent: usize = 0;

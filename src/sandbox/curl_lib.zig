@@ -23,12 +23,21 @@
 // Same lifecycle, no on-disk file, no cross-request leaking.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("../compat.zig");
+
+// libcurl-impersonate static lib is MSVC-only on Windows (vendor drop ships
+// .lib files compiled with MSVC). Mingw cross-compiles (x86_64-windows-gnu)
+// cannot link them, so we comptime-elide the FFI surface and `perform` returns
+// CurlInitFailed — the caller (sandbox network layer) falls back to subprocess
+// curl in that environment. Same fallback the build.zig "no vendored libcurl"
+// warn-path already promised; this just makes the link complete.
+const have_curl: bool = !(builtin.os.tag == .windows and builtin.abi != .msvc);
 
 // ───────────────────────────────────────────────────────────────────────────
 // C declarations
 // ───────────────────────────────────────────────────────────────────────────
-const c = struct {
+const c = if (have_curl) struct {
     const CURLcode = c_int;
     const CURLINFO = c_int;
     const CURLoption = c_int;
@@ -81,6 +90,63 @@ const c = struct {
     /// `target` examples: "chrome131", "chrome120", "firefox133", "safari17_0".
     /// `default_headers`: 1 to add the browser's default headers, 0 to skip.
     extern "c" fn curl_easy_impersonate(handle: *CURL, target: [*:0]const u8, default_headers: c_int) CURLcode;
+} else struct {
+    // Stub `c` namespace for mingw cross-compile. Only `curl_easy_init` is
+    // ever called before any FFI in `perform`; returning null short-circuits
+    // to CurlInitFailed and the caller routes to subprocess-curl fallback.
+    const CURLcode = c_int;
+    const CURLINFO = c_int;
+    const CURLoption = c_int;
+    const CURL = anyopaque;
+    const curl_slist = extern struct {
+        data: ?[*:0]const u8,
+        next: ?*curl_slist,
+    };
+    const CURLE_OK: CURLcode = 0;
+    const CURLINFO_RESPONSE_CODE: CURLINFO = 0x200002;
+    const CURLINFO_EFFECTIVE_URL: CURLINFO = 0x100001;
+    const CURLINFO_REDIRECT_COUNT: CURLINFO = 0x20000C;
+    const CURLOPT_URL: CURLoption = 10002;
+    const CURLOPT_HTTPHEADER: CURLoption = 10023;
+    const CURLOPT_WRITEFUNCTION: CURLoption = 20011;
+    const CURLOPT_WRITEDATA: CURLoption = 10001;
+    const CURLOPT_HEADERFUNCTION: CURLoption = 20079;
+    const CURLOPT_HEADERDATA: CURLoption = 10029;
+    const CURLOPT_CUSTOMREQUEST: CURLoption = 10036;
+    const CURLOPT_POSTFIELDS: CURLoption = 10015;
+    const CURLOPT_POSTFIELDSIZE_LARGE: CURLoption = 30120;
+    const CURLOPT_FOLLOWLOCATION: CURLoption = 52;
+    const CURLOPT_MAXREDIRS: CURLoption = 68;
+    const CURLOPT_TIMEOUT_MS: CURLoption = 155;
+    const CURLOPT_CONNECTTIMEOUT_MS: CURLoption = 156;
+    const CURLOPT_NOSIGNAL: CURLoption = 99;
+    const CURLOPT_COOKIE: CURLoption = 10022;
+    const CURLOPT_USERAGENT: CURLoption = 10018;
+    const CURLOPT_ACCEPT_ENCODING: CURLoption = 10102;
+    const CURLOPT_PROXY: CURLoption = 10004;
+    fn curl_easy_init() ?*CURL {
+        return null;
+    }
+    fn curl_easy_cleanup(_: *CURL) void {}
+    fn curl_easy_perform(_: *CURL) CURLcode {
+        return 1; // any non-zero CURLcode → CurlPerformFailed
+    }
+    fn curl_easy_setopt(_: *CURL, _: CURLoption, _: anytype) CURLcode {
+        return 1;
+    }
+    fn curl_easy_getinfo(_: *CURL, _: CURLINFO, _: anytype) CURLcode {
+        return 1;
+    }
+    fn curl_easy_strerror(_: CURLcode) [*:0]const u8 {
+        return "libcurl-impersonate unavailable on mingw build (msvc-only vendor drop)";
+    }
+    fn curl_slist_append(_: ?*curl_slist, _: [*:0]const u8) ?*curl_slist {
+        return null;
+    }
+    fn curl_slist_free_all(_: ?*curl_slist) void {}
+    fn curl_easy_impersonate(_: *CURL, _: [*:0]const u8, _: c_int) CURLcode {
+        return 1;
+    }
 };
 
 // ───────────────────────────────────────────────────────────────────────────

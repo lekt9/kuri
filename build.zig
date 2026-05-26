@@ -81,7 +81,8 @@ pub fn build(b: *std.Build) void {
     // (src/sandbox/curl_lib.zig) wraps it for the bundle replay sandbox.
     const ci_arch_os = pickCurlImpersonateTriple(target.result) catch null;
     if (ci_arch_os) |triple| {
-        const ci_lib_path = b.path(b.fmt("vendor/curl-impersonate/{s}/libcurl-impersonate.a", .{triple}));
+        const archive_name = curlImpersonateArchiveFilename(target.result);
+        const ci_lib_path = b.path(b.fmt("vendor/curl-impersonate/{s}/{s}", .{ triple, archive_name }));
         const ci_include = b.path("vendor/curl-impersonate/include");
         for ([_]*std.Build.Step.Compile{ exe, unit_tests }) |compile_step| {
             compile_step.root_module.addObjectFile(ci_lib_path);
@@ -106,6 +107,33 @@ pub fn build(b: *std.Build) void {
                 compile_step.root_module.linkSystemLibrary("dl", .{});
                 compile_step.root_module.linkSystemLibrary("idn2", .{});
             }
+            if (target.result.os.tag == .windows) {
+                // libcurl-impersonate on Windows pulls in MSVC-flavored
+                // BoringSSL + zlib + brotli + nghttp2 + zstd; the vendor
+                // dir ships each as its own .lib alongside libcurl-impersonate.lib.
+                // We add each as an object file so lld-link resolves the
+                // curl_easy_* + brotli/zstd/zlib transitive symbols.
+                const vendor_libs = [_][]const u8{
+                    "crypto.lib", "ssl.lib",
+                    "nghttp2.lib", "nghttp3.lib",
+                    "ngtcp2.lib", "ngtcp2_crypto_boringssl.lib",
+                    "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib",
+                    "zlib.lib", "zstd.lib",
+                };
+                for (vendor_libs) |libname| {
+                    compile_step.root_module.addObjectFile(
+                        b.path(b.fmt("vendor/curl-impersonate/{s}/{s}", .{ triple, libname })),
+                    );
+                }
+                // Windows system libs required by BoringSSL / curl's WIN32
+                // adapters: ws2_32 (winsock), crypt32 (cert store),
+                // bcrypt (PRNG), advapi32 (registry), userenv (profile).
+                compile_step.root_module.linkSystemLibrary("ws2_32", .{});
+                compile_step.root_module.linkSystemLibrary("crypt32", .{});
+                compile_step.root_module.linkSystemLibrary("bcrypt", .{});
+                compile_step.root_module.linkSystemLibrary("advapi32", .{});
+                compile_step.root_module.linkSystemLibrary("userenv", .{});
+            }
         }
     } else {
         std.log.warn(
@@ -126,8 +154,9 @@ pub fn build(b: *std.Build) void {
     sandbox_tests.root_module.linkLibrary(quickjs_dep.artifact("quickjs-ng"));
     // Same curl-impersonate wiring as exe + unit_tests so curl_lib symbols resolve.
     if (pickCurlImpersonateTriple(target.result) catch null) |triple| {
+        const sandbox_archive = curlImpersonateArchiveFilename(target.result);
         sandbox_tests.root_module.addObjectFile(
-            b.path(b.fmt("vendor/curl-impersonate/{s}/libcurl-impersonate.a", .{triple})),
+            b.path(b.fmt("vendor/curl-impersonate/{s}/{s}", .{ triple, sandbox_archive })),
         );
         sandbox_tests.root_module.addIncludePath(b.path("vendor/curl-impersonate/include"));
         if (target.result.os.tag == .macos) {
@@ -268,6 +297,29 @@ fn pickCurlImpersonateTriple(t: std.Target) ![]const u8 {
             .x86_64 => "x86_64-linux-gnu",
             else => error.UnsupportedTriple,
         },
+        // The vendored Windows libcurl-impersonate is built with MSVC
+        // (BoringSSL/zlib/etc. all MSVC-flavored .lib). Only return a
+        // triple when the build target is MSVC ABI — mingw (gnu)
+        // cross-compiles fall through to the subprocess-curl fallback.
+        // Verifying MSVC builds requires a Windows host with MSVC + the
+        // Windows SDK; Zig cannot synthesize those headers from a
+        // POSIX host.
+        .windows => if (t.abi == .msvc) switch (t.cpu.arch) {
+            .aarch64 => "aarch64-windows",
+            .x86_64 => "x86_64-windows",
+            else => error.UnsupportedTriple,
+        } else error.UnsupportedTriple,
         else => error.UnsupportedTriple,
     };
+}
+
+/// Static archive filename for libcurl-impersonate per target. POSIX
+/// platforms ship the conventional `libcurl-impersonate.a`; the Windows
+/// vendor drop is MSVC-style and uses `libcurl-impersonate.lib`. The
+/// caller composes `vendor/curl-impersonate/<triple>/<filename>`.
+fn curlImpersonateArchiveFilename(t: std.Target) []const u8 {
+    return if (t.os.tag == .windows)
+        "libcurl-impersonate.lib"
+    else
+        "libcurl-impersonate.a";
 }
