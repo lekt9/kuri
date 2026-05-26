@@ -298,23 +298,15 @@ fn cmdOpen(arena: std.mem.Allocator, port: u16, url: ?[]const u8) !void {
 
     if (url) |u| try argv.append(arena, u);
 
-    // Fork and exec Chrome
-    const pid = std.c.fork();
-    if (pid < 0) {
-        fatal("Failed to fork for Chrome launch\n", .{});
-    }
-    if (pid == 0) {
-        // Child process: exec Chrome
-        var c_argv: [64]?[*:0]const u8 = undefined;
-        for (argv.items, 0..) |arg, i| {
-            if (i >= c_argv.len - 1) break;
-            c_argv[i] = @ptrCast(arg.ptr);
-        }
-        c_argv[argv.items.len] = null;
-        const c_execvp = @extern(*const fn ([*:0]const u8, [*:null]const ?[*:0]const u8) callconv(.c) c_int, .{ .name = "execvp" });
-        _ = c_execvp(@ptrCast(argv.items[0].ptr), @ptrCast(&c_argv));
-        std.c._exit(127);
-    }
+    // Spawn Chrome via the platform-compat layer. On POSIX, this fork/execs
+    // (same shape as before). On Windows, this calls CreateProcessW under
+    // the hood. The compat primitive handles both ABIs identically from
+    // the caller's view. Pre-2026-05-26 this was a direct std.c.fork() +
+    // execvp call that failed to compile on x86_64-windows-gnu (mingw
+    // libc has no fork()).
+    _ = compat.spawnDetached(arena, argv.items) catch {
+        fatal("Failed to spawn Chrome\n", .{});
+    };
 
     // 3. Poll for CDP — try the requested port first, then fall back to 9222
     std.debug.print("Launching Chrome...\n", .{});
