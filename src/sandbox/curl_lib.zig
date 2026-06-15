@@ -136,6 +136,98 @@ pub const Error = error{
 };
 
 // ───────────────────────────────────────────────────────────────────────────
+// Pure-Zig fallback (Windows): std.http.Client
+// ───────────────────────────────────────────────────────────────────────────
+//
+// libcurl-impersonate is not linked on the x86_64-windows-gnu target (the
+// vendored archives are MSVC-ABI). Rather than fail every `fetch`, we run the
+// request through Zig's std.http.Client. It produces the same Response shape
+// (status + raw CRLF header block + decompressed body), so network.zig's
+// status/Set-Cookie parsing works unchanged. The one capability lost vs the
+// curl path is browser TLS impersonation — anti-bot sites still escalate to
+// CDP browse, which uses a different path entirely.
+
+const default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " ++
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+fn performStd(allocator: std.mem.Allocator, req: Request) Error!Response {
+    return performStdInner(allocator, req) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.CurlPerformFailed,
+    };
+}
+
+fn performStdInner(allocator: std.mem.Allocator, req: Request) !Response {
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+    };
+    defer client.deinit();
+
+    // Outgoing headers: caller headers + cookie header + a default User-Agent
+    // when the caller did not supply one.
+    var extra: std.ArrayList(std.http.Header) = .empty;
+    defer extra.deinit(allocator);
+    var has_ua = false;
+    for (req.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) has_ua = true;
+        try extra.append(allocator, .{ .name = h.name, .value = h.value });
+    }
+    if (!has_ua) try extra.append(allocator, .{ .name = "User-Agent", .value = default_ua });
+    if (req.cookie_header.len > 0) {
+        try extra.append(allocator, .{ .name = "Cookie", .value = req.cookie_header });
+    }
+
+    const method = std.meta.stringToEnum(std.http.Method, req.method) orelse .GET;
+    const uri = try std.Uri.parse(req.url);
+
+    var redirect_buf: [16 * 1024]u8 = undefined;
+    var http_req = try client.request(method, uri, .{
+        // Follow redirects internally (parity with libcurl FOLLOWLOCATION); the
+        // final response head/body is what network.zig parses.
+        .redirect_behavior = @enumFromInt(@as(u16, @intCast(req.max_redirects))),
+        .extra_headers = extra.items,
+    });
+    defer http_req.deinit();
+
+    if (req.body) |b| {
+        const body_mut = try allocator.dupe(u8, b);
+        defer allocator.free(body_mut);
+        try http_req.sendBodyComplete(body_mut);
+    } else {
+        try http_req.sendBodiless();
+    }
+
+    var response = try http_req.receiveHead(&redirect_buf);
+    const status_code: u16 = @intFromEnum(response.head.status);
+
+    // head.bytes is the raw CRLF header block including the HTTP status line —
+    // exactly the format network.zig expects in Response.raw_headers.
+    const raw_headers = try allocator.dupe(u8, response.head.bytes);
+    errdefer allocator.free(raw_headers);
+
+    const final_url = try allocator.dupe(u8, req.url);
+    errdefer allocator.free(final_url);
+
+    var body_buf: std.ArrayList(u8) = .empty;
+    errdefer body_buf.deinit(allocator);
+    var transfer_buf: [8192]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    const reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
+    try reader.appendRemainingUnlimited(allocator, &body_buf);
+
+    return .{
+        .allocator = allocator,
+        .status = status_code,
+        .final_url = final_url,
+        .redirect_count = 0,
+        .raw_headers = raw_headers,
+        .body = try body_buf.toOwnedSlice(allocator),
+    };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -143,11 +235,13 @@ pub const Error = error{
 /// Caller owns the returned Response and must call `deinit`.
 pub fn perform(allocator: std.mem.Allocator, req: Request) Error!Response {
     // Windows: libcurl-impersonate is not linked (the vendored .lib archives are
-    // MSVC-ABI, incompatible with the x86_64-windows-gnu cross-target). Returning
-    // before any curl extern keeps those symbols unreferenced so the binary links;
-    // the sandbox replay path treats this like any other curl failure and falls
-    // back. CDP browse (go/snap/close) does not use this path.
-    if (comptime @import("builtin").os.tag == .windows) return error.NotImplementedOnWindows;
+    // MSVC-ABI, incompatible with the x86_64-windows-gnu cross-target). Route through
+    // the pure-Zig std.http.Client path instead of failing, so `fetch` works on
+    // Windows. Returning before any curl extern keeps those symbols unreferenced, so
+    // the binary still links. The only capability lost vs the curl path is browser
+    // TLS impersonation; anti-bot sites still escalate to CDP browse (go/snap/close),
+    // which does not use this path.
+    if (comptime @import("builtin").os.tag == .windows) return performStd(allocator, req);
     const easy = c.curl_easy_init() orelse return error.CurlInitFailed;
     defer c.curl_easy_cleanup(easy);
 
