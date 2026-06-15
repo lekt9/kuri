@@ -157,6 +157,7 @@ pub const Launcher = struct {
             const data_dir = try std.fmt.allocPrint(self.allocator, "--user-data-dir={s}/.kuri/chrome-profile", .{home});
             try argv_list.append(self.allocator, data_dir);
         }
+        try appendManagedProfileSafetyFlags(self.allocator, &argv_list);
         // Only use --no-sandbox on Linux (needed for containers), it's a detection signal on macOS
         if (@import("builtin").os.tag == .linux) {
             try argv_list.append(self.allocator, "--no-sandbox");
@@ -176,7 +177,7 @@ pub const Launcher = struct {
         try argv_list.append(self.allocator, "--disable-background-timer-throttling");
         try argv_list.append(self.allocator, "--disable-backgrounding-occluded-windows");
         try argv_list.append(self.allocator, "--disable-renderer-backgrounding");
-        try argv_list.append(self.allocator, "--disable-features=CalculateNativeWinOcclusion");
+        try argv_list.append(self.allocator, "--disable-features=CalculateNativeWinOcclusion,PasswordManagerOnboarding,AutofillServerCommunication");
 
         if (self.proxy) |proxy_url| {
             const proxy_flag = try std.fmt.allocPrint(self.allocator, "--proxy-server={s}", .{proxy_url});
@@ -366,6 +367,24 @@ pub const Launcher = struct {
         self.ws_url_len = ws_url.len;
     }
 };
+
+fn appendManagedProfileSafetyFlags(
+    allocator: std.mem.Allocator,
+    argv_list: *std.ArrayList([]const u8),
+) !void {
+    // Managed Kuri profiles are automation sandboxes, not a user's daily
+    // Chrome profile. On macOS, Chrome otherwise asks Keychain to create/read
+    // the "Chrome" Safe Storage item; under agent harnesses that set HOME to a
+    // temp directory this surfaces as the modal "Keychain Not Found" dialog.
+    // Keep managed profiles local and non-interactive. Existing/user-attached
+    // Chrome sessions are not affected because this helper only runs for
+    // Launcher.Mode.managed launches.
+    if (@import("builtin").os.tag == .macos) {
+        try argv_list.append(allocator, "--use-mock-keychain");
+    }
+    try argv_list.append(allocator, "--password-store=basic");
+    try argv_list.append(allocator, "--disable-save-password-bubble");
+}
 
 // ── Extension utilities ─────────────────────────────────────────────────
 
@@ -612,6 +631,28 @@ fn extractWsUrl(body: []const u8) ?[]const u8 {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "managed Chrome safety flags avoid OS keychain prompts" {
+    var flags: std.ArrayList([]const u8) = .empty;
+    defer flags.deinit(std.testing.allocator);
+
+    try appendManagedProfileSafetyFlags(std.testing.allocator, &flags);
+
+    var has_password_store = false;
+    var has_disable_save_password = false;
+    var has_mock_keychain = false;
+    for (flags.items) |flag| {
+        if (std.mem.eql(u8, flag, "--password-store=basic")) has_password_store = true;
+        if (std.mem.eql(u8, flag, "--disable-save-password-bubble")) has_disable_save_password = true;
+        if (std.mem.eql(u8, flag, "--use-mock-keychain")) has_mock_keychain = true;
+    }
+
+    try std.testing.expect(has_password_store);
+    try std.testing.expect(has_disable_save_password);
+    if (@import("builtin").os.tag == .macos) {
+        try std.testing.expect(has_mock_keychain);
+    }
+}
 
 test "findFreePort returns a port" {
     // Should find some free port in the range — CI won't have 9222+ bound

@@ -293,6 +293,11 @@ fn cmdOpen(arena: std.mem.Allocator, port: u16, url: ?[]const u8) !void {
     const home = compat.getenv("HOME") orelse "/tmp";
     const data_dir = try std.fmt.allocPrint(arena, "--user-data-dir={s}/.kuri/chrome-profile", .{home});
     try argv.append(arena, data_dir);
+    if (@import("builtin").os.tag == .macos) {
+        try argv.append(arena, "--use-mock-keychain");
+    }
+    try argv.append(arena, "--password-store=basic");
+    try argv.append(arena, "--disable-save-password-bubble");
 
     // Load extensions from KURI_EXTENSIONS env var
     if (compat.getenv("KURI_EXTENSIONS")) |ext_str| {
